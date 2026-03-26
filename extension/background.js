@@ -239,7 +239,7 @@ async function cleanupOldVersions(token, sid, keepCount = 5) {
 // Bearer Token Capture (via webRequest)
 // ============================================================
 
-// Stores captured bearer tokens per domain: { "mail.superhuman.com": { token, capturedAt } }
+// Stores captured bearer tokens per domain: { "example.com": { token, capturedAt } }
 const capturedTokens = {};
 
 // Listen for requests to watched domains and capture Authorization headers
@@ -253,18 +253,9 @@ chrome.webRequest.onSendHeaders.addListener(
         const host = new URL(details.url).hostname;
         const token = authHeader.value.substring(7); // strip "Bearer "
 
-        // Also capture x-superhuman-* headers
-        const extraHeaders = {};
-        for (const h of details.requestHeaders || []) {
-          if (h.name.toLowerCase().startsWith('x-superhuman-')) {
-            extraHeaders[h.name] = h.value;
-          }
-        }
-
         capturedTokens[host] = {
           token,
           capturedAt: new Date().toISOString(),
-          extraHeaders,
         };
         console.log(`[CookieShare] Captured bearer token for ${host} (${token.substring(0, 20)}...)`);
       } catch {}

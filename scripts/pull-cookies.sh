@@ -5,9 +5,9 @@
 # Handles both compressed (gzip) and uncompressed payloads.
 #
 # Examples:
-#   pull-cookies.sh superhuman.com --project my-gcp-project
-#   pull-cookies.sh superhuman.com --project my-gcp-project --cookies-only
-#   pull-cookies.sh superhuman.com --project my-gcp-project | jq '.cookies'
+#   pull-cookies.sh github.com --project my-gcp-project
+#   pull-cookies.sh github.com --project my-gcp-project --cookies-only
+#   pull-cookies.sh github.com --project my-gcp-project | jq '.cookies'
 
 set -euo pipefail
 

@@ -102,7 +102,7 @@ and outputs JSON. Pipe it into Playwright, requests, curl, or whatever you want.
                               Google Secret Manager REST API
                               ┌──────────────────────────────┐
                               │ cookie-share-github-com       │
-                              │ cookie-share-superhuman-com   │
+                              │ cookie-share-example-com      │
                               │ cookie-share-mail-google-com  │
                               │ ...                           │
                               └──────────────┬───────────────┘
