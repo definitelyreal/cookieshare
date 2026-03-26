@@ -20,9 +20,7 @@ If you don't have a GCP project yet, create one at [console.cloud.google.com](ht
 2. Select your project from the dropdown at the top
 3. Click **Enable**
 
-![Enable Secret Manager API](images/01-enable-secret-manager.png)
-
-> **Tip:** You can also do this from the command line:
+> **Or from the command line:**
 > ```bash
 > gcloud services enable secretmanager.googleapis.com --project=YOUR_PROJECT_ID
 > ```
@@ -37,14 +35,9 @@ We need to load the extension first to get its Extension ID, which we'll need fo
 2. Enable **Developer mode** (toggle in the top right)
 3. Click **Load unpacked**
 4. Select the `extension/` folder from this repo
-
-![Load unpacked extension](images/02-load-extension.png)
-
 5. Note the **Extension ID** shown on the card — you'll need this in the next step
 
-![Extension ID](images/03-extension-id.png)
-
-> The Extension ID looks like: `abcdefghijklmnopqrstuvwxyz012345`
+> The Extension ID is a 32-character string like `abcdefghijklmnopqrstuvwxyz012345`. It's displayed under the extension name on the card.
 
 ---
 
@@ -52,16 +45,12 @@ We need to load the extension first to get its Extension ID, which we'll need fo
 
 1. Go to [APIs & Services → Credentials](https://console.cloud.google.com/apis/credentials) in your GCP Console
 2. Click **+ CREATE CREDENTIALS** → **OAuth client ID**
-
-![Create credentials](images/04-create-credentials.png)
-
 3. If prompted, configure the **OAuth consent screen** first:
    - Choose **External** (unless you have a Workspace org)
    - Fill in the app name (e.g., "cookieshare") and your email
    - Skip scopes — we'll handle this in the manifest
    - Add yourself as a test user
    - Save and go back to creating credentials
-
 4. For Application type, select **Web application**
 5. Name it something like "cookieshare extension"
 6. Under **Authorized redirect URIs**, click **+ ADD URI** and enter:
@@ -72,12 +61,8 @@ We need to load the extension first to get its Extension ID, which we'll need fo
 
    Replace `YOUR_EXTENSION_ID` with the ID from Step 2.
 
-![OAuth redirect URI](images/05-oauth-redirect-uri.png)
-
 7. Click **Create**
 8. Copy the **Client ID** (it looks like `123456789-abcdef.apps.googleusercontent.com`)
-
-![Copy client ID](images/06-copy-client-id.png)
 
 ---
 
@@ -95,9 +80,7 @@ We need to load the extension first to get its Extension ID, which we'll need fo
    }
    ```
 
-3. Go back to `chrome://extensions/` and click the **reload** button on the cookieshare card
-
-![Reload extension](images/07-reload-extension.png)
+3. Go back to `chrome://extensions/` and click the **reload** button (circular arrow) on the cookieshare card
 
 ---
 
@@ -107,8 +90,6 @@ We need to load the extension first to get its Extension ID, which we'll need fo
 2. Scroll to **Settings**
 3. Enter your GCP Project ID
 4. Click **Save Settings**
-
-![Set project ID](images/08-set-project-id.png)
 
 > **Where to find your Project ID:** It's in the GCP Console URL (`console.cloud.google.com/home/dashboard?project=YOUR_PROJECT_ID`) or on the project dashboard page.
 
@@ -124,11 +105,8 @@ gcloud projects add-iam-policy-binding YOUR_PROJECT_ID \
   --role="roles/secretmanager.admin"
 ```
 
-![IAM permissions](images/09-iam-permissions.png)
-
 > **For production use**, scope this down:
 > ```bash
-> # Create a custom role with just what's needed
 > gcloud projects add-iam-policy-binding YOUR_PROJECT_ID \
 >   --member="user:YOUR_EMAIL@gmail.com" \
 >   --role="roles/secretmanager.secretVersionAdder"
@@ -141,17 +119,9 @@ gcloud projects add-iam-policy-binding YOUR_PROJECT_ID \
 1. Navigate to a website you want to sync (make sure you're logged in)
 2. Click the cookieshare extension icon
 3. Click **Sync This Site**
-
-![Sync this site](images/10-sync-this-site.png)
-
 4. Chrome will ask you to approve host permissions — click **Allow**
 5. A Google sign-in popup will appear (first time only) — sign in with the account that has IAM access
-
-![Google sign-in](images/11-google-signin.png)
-
 6. The popup should now show sync status: cookie count, storage keys, and last sync time
-
-![Sync success](images/12-sync-success.png)
 
 ---
 
@@ -232,25 +202,3 @@ gcloud iam service-accounts keys create key.json \
 # On the remote machine, authenticate with the key
 gcloud auth activate-service-account --key-file=key.json
 ```
-
----
-
-## Taking Screenshots for This Guide
-
-> **For contributors:** If you're updating this guide, take screenshots at 2x resolution
-> (Retina) and save as PNG. Use the browser at a standard width (~1200px). Crop to show just
-> the relevant UI, not the full browser window. Save to `docs/images/`.
-
-Screenshots needed:
-1. `01-enable-secret-manager.png` — Secret Manager API page with Enable button
-2. `02-load-extension.png` — chrome://extensions with Load unpacked button
-3. `03-extension-id.png` — Extension card showing the ID
-4. `04-create-credentials.png` — Credentials page with Create button
-5. `05-oauth-redirect-uri.png` — OAuth form with redirect URI filled in
-6. `06-copy-client-id.png` — Dialog showing the new Client ID
-7. `07-reload-extension.png` — Extension card with reload button
-8. `08-set-project-id.png` — Options page Settings section
-9. `09-iam-permissions.png` — Terminal showing gcloud IAM command
-10. `10-sync-this-site.png` — Extension popup with Sync This Site button
-11. `11-google-signin.png` — Google OAuth consent screen
-12. `12-sync-success.png` — Extension popup showing successful sync
