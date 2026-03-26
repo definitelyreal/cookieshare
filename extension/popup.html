@@ -1,0 +1,58 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <link rel="stylesheet" href="popup.css">
+</head>
+<body>
+  <div id="app">
+    <header>
+      <h1>Cookie Share</h1>
+    </header>
+
+    <!-- State: current site not watched -->
+    <div id="add-section" class="section hidden">
+      <div class="site-name" id="current-domain"></div>
+      <button id="btn-sync-site" class="btn btn-primary">Sync This Site</button>
+    </div>
+
+    <!-- State: current site already watched -->
+    <div id="status-section" class="section hidden">
+      <div class="site-name" id="watched-domain"></div>
+      <div class="status-row">
+        <span class="label">Last sync</span>
+        <span id="last-sync" class="value">—</span>
+      </div>
+      <div class="status-row">
+        <span class="label">Cookies</span>
+        <span id="cookie-count" class="value">—</span>
+      </div>
+      <div class="status-row">
+        <span class="label">Storage keys</span>
+        <span id="storage-count" class="value">—</span>
+      </div>
+      <div class="status-row" id="error-row" style="display:none">
+        <span class="label">Error</span>
+        <span id="sync-error" class="value error">—</span>
+      </div>
+      <div class="btn-row">
+        <button id="btn-sync-now" class="btn btn-secondary">Sync Now</button>
+        <button id="btn-remove" class="btn btn-danger">Remove</button>
+      </div>
+    </div>
+
+    <!-- State: no tab / chrome:// page -->
+    <div id="no-site-section" class="section hidden">
+      <p class="muted">Navigate to a website to sync it.</p>
+    </div>
+
+    <footer>
+      <div class="footer-stats">
+        <span id="domain-count">0</span> sites synced
+      </div>
+      <a href="#" id="link-options">Manage Sites</a>
+    </footer>
+  </div>
+  <script src="popup.js"></script>
+</body>
+</html>

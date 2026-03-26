@@ -1,0 +1,34 @@
+{
+  "manifest_version": 3,
+  "name": "Cookie Share",
+  "version": "1.0.0",
+  "description": "Syncs session data (cookies, localStorage) to Google Secret Manager for authorized domains",
+  "permissions": [
+    "cookies",
+    "identity",
+    "alarms",
+    "storage",
+    "scripting",
+    "activeTab",
+    "tabs",
+    "webRequest"
+  ],
+  "optional_host_permissions": ["<all_urls>"],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "action": {
+    "default_popup": "popup.html",
+    "default_title": "Cookie Share"
+  },
+  "options_page": "options.html",
+  "content_security_policy": {
+    "extension_pages": "script-src 'self'; object-src 'none'; connect-src https://secretmanager.googleapis.com https://accounts.google.com https://oauth2.googleapis.com"
+  },
+  "oauth2": {
+    "client_id": "YOUR_CLIENT_ID_HERE.apps.googleusercontent.com",
+    "scopes": [
+      "https://www.googleapis.com/auth/cloud-platform"
+    ]
+  }
+}
