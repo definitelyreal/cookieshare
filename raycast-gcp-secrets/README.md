@@ -30,10 +30,11 @@ Permanently delete a secret (with confirmation).
 
 ## Setup
 
-1. Clone this repo and install dependencies:
+> This extension lives inside the [`cookieshare`](https://github.com/definitelyreal/cookieshare) repo under `raycast-gcp-secrets/`. (The former standalone repo is archived.)
+
+1. From a checkout of the repo, install dependencies and run dev mode:
    ```bash
-   git clone https://github.com/definitelyreal/raycast-gcp-secrets.git
-   cd raycast-gcp-secrets
+   cd cookieshare/raycast-gcp-secrets
    npm install
    ```
 

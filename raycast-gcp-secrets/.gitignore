@@ -3,3 +3,6 @@ dist/
 .DS_Store
 *.tsbuildinfo
 raycast-env.d.ts
+
+# Personal/machine-specific dev notes — never publish
+*.local.md
