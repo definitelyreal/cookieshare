@@ -1,19 +1,29 @@
 #!/bin/bash
-# Pull session data (cookies + localStorage) from Google Secret Manager
-# Usage: pull-cookies.sh <domain> --project <gcp-project-id> [--cookies-only]
+# Pull session data (cookies + localStorage + captured auth headers) from
+# Google Secret Manager.
+#
+# Usage: pull-cookies.sh <domain> --project <gcp-project-id> [flag]
+#   --cookies-only     Output just the cookies array
+#   --auth-only        Output just the captured Authorization headers map
+#   --token [<host>]   Output just the raw Authorization header value
+#                      (picks the domain's host if --token has no argument)
 #
 # Handles both compressed (gzip) and uncompressed payloads.
 #
 # Examples:
 #   pull-cookies.sh github.com --project my-gcp-project
 #   pull-cookies.sh github.com --project my-gcp-project --cookies-only
-#   pull-cookies.sh github.com --project my-gcp-project | jq '.cookies'
+#   pull-cookies.sh discord.com --project my-gcp-project --auth-only
+#   pull-cookies.sh discord.com --project my-gcp-project --token
 
 set -euo pipefail
 
 DOMAIN=""
 PROJECT=""
 COOKIES_ONLY=false
+AUTH_ONLY=false
+TOKEN_MODE=false
+TOKEN_HOST=""
 
 # Parse arguments
 while [[ $# -gt 0 ]]; do
@@ -25,6 +35,22 @@ while [[ $# -gt 0 ]]; do
     --cookies-only)
       COOKIES_ONLY=true
       shift
+      ;;
+    --auth-only)
+      AUTH_ONLY=true
+      shift
+      ;;
+    --token)
+      TOKEN_MODE=true
+      shift
+      # Optional host argument
+      if [[ $# -gt 0 && "$1" != -* ]]; then
+        # If the next arg doesn't look like a domain (no dot) treat it as DOMAIN
+        if [[ "$1" == *.* ]]; then
+          TOKEN_HOST="$1"
+          shift
+        fi
+      fi
       ;;
     -*)
       echo "Unknown flag: $1" >&2
@@ -73,6 +99,28 @@ fi
 # Output
 if [[ "$COOKIES_ONLY" == true ]]; then
   echo "$DATA" | jq '.cookies'
+elif [[ "$AUTH_ONLY" == true ]]; then
+  echo "$DATA" | jq '.authHeaders // .bearerTokens // {}'
+elif [[ "$TOKEN_MODE" == true ]]; then
+  HOST="${TOKEN_HOST:-$DOMAIN}"
+  # Prefer new authHeaders.raw; fall back to legacy bearerTokens.token
+  TOKEN=$(echo "$DATA" | jq -r \
+    --arg h "$HOST" \
+    --arg d "$DOMAIN" \
+    '(.authHeaders[$h].raw
+      // .authHeaders[$d].raw
+      // (.authHeaders // {} | to_entries | map(select(.key | endswith($d))) | .[0].value.raw)
+      // .bearerTokens[$h].token
+      // .bearerTokens[$d].token
+      // (.bearerTokens // {} | to_entries | map(select(.key | endswith($d))) | .[0].value.token)
+      // empty)')
+  if [[ -z "$TOKEN" ]]; then
+    echo "Error: No captured auth header found for host '$HOST' in secret '$SECRET_ID'" >&2
+    echo "Available hosts:" >&2
+    echo "$DATA" | jq -r '(.authHeaders // .bearerTokens // {}) | keys[]' >&2
+    exit 1
+  fi
+  echo "$TOKEN"
 else
   echo "$DATA"
 fi

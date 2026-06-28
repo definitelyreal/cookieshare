@@ -236,34 +236,181 @@ async function cleanupOldVersions(token, sid, keepCount = 5) {
 }
 
 // ============================================================
-// Bearer Token Capture (via webRequest)
+// Authorization Header Capture (via webRequest)
 // ============================================================
+//
+// Captures ANY Authorization header value, not just "Bearer ..." schemes.
+// Services like Discord use the raw token directly (no scheme prefix), so
+// we store the full raw value plus a parsed scheme/token split.
+//
+// Persisted to chrome.storage.local under key "capturedAuth" so values
+// survive service-worker restarts. Format:
+//   { "<host>": { scheme, token, raw, capturedAt } }
 
-// Stores captured bearer tokens per domain: { "example.com": { token, capturedAt } }
-const capturedTokens = {};
+const CAPTURED_AUTH_KEY = 'capturedAuth';
 
-// Listen for requests to watched domains and capture Authorization headers
+function parseAuthHeader(value) {
+  // Standard schemes: "Bearer xyz", "Basic xyz", "Token xyz", "Digest ..."
+  // Discord: raw token with no scheme prefix, e.g. "MTI3...xxx" or "mfa.xxx"
+  const m = value.match(/^([A-Za-z][A-Za-z0-9_-]*)\s+(.+)$/);
+  if (m) return { scheme: m[1], token: m[2] };
+  return { scheme: null, token: value };
+}
+
+// Persist every new capture synchronously. MV3 service workers can be
+// torn down at any time, so we must not buffer in memory. Writes are
+// deduplicated by comparing against the last stored value for that host.
+async function captureAuthHeader(url, rawValue, sourceLabel = 'webRequest') {
+  let host;
+  try { host = new URL(url).hostname; } catch { return; }
+
+  const { [CAPTURED_AUTH_KEY]: stored = {} } = await chrome.storage.local.get(CAPTURED_AUTH_KEY);
+  if (stored[host]?.raw === rawValue) return;
+
+  const { scheme, token } = parseAuthHeader(rawValue);
+  stored[host] = {
+    scheme,
+    token,
+    raw: rawValue,
+    capturedAt: new Date().toISOString(),
+    source: sourceLabel,
+  };
+  await chrome.storage.local.set({ [CAPTURED_AUTH_KEY]: stored });
+
+  const preview = token.length > 20 ? token.substring(0, 20) + '...' : token;
+  console.log(`[CookieShare] Captured auth for ${host} via ${sourceLabel} (scheme=${scheme || 'none'}, token=${preview})`);
+}
+
+// Path 1: chrome.webRequest — fast when the SW is awake. Can miss requests
+// in MV3 when the SW is dormant, so we also run a content-script interceptor.
 chrome.webRequest.onSendHeaders.addListener(
   (details) => {
     const authHeader = details.requestHeaders?.find(
       h => h.name.toLowerCase() === 'authorization'
     );
-    if (authHeader?.value?.startsWith('Bearer ')) {
-      try {
-        const host = new URL(details.url).hostname;
-        const token = authHeader.value.substring(7); // strip "Bearer "
-
-        capturedTokens[host] = {
-          token,
-          capturedAt: new Date().toISOString(),
-        };
-        console.log(`[CookieShare] Captured bearer token for ${host} (${token.substring(0, 20)}...)`);
-      } catch {}
-    }
+    if (!authHeader?.value) return;
+    captureAuthHeader(details.url, authHeader.value, 'webRequest').catch(() => {});
   },
   { urls: ["<all_urls>"] },
   ["requestHeaders", "extraHeaders"]
 );
+
+// Path 2: content-script interceptor — patches fetch/XHR in the page so it
+// catches every outgoing authed request regardless of SW state. The script
+// posts to this SW via chrome.runtime.sendMessage; see the handler in the
+// messageHandlers object below.
+
+// ============================================================
+// Content Script Registration (for auth interceptor)
+// ============================================================
+//
+// We register content scripts dynamically so they only run on watched
+// domains (where the user has granted host permission). On SW start we
+// reconcile the registered scripts against the current watched-domains
+// list.
+
+const AUTH_CONTENT_SCRIPT_PREFIX = 'cookieshare-auth-';
+
+function authScriptIdsForDomain(domain) {
+  return {
+    main: `${AUTH_CONTENT_SCRIPT_PREFIX}main-${domain}`,
+    bridge: `${AUTH_CONTENT_SCRIPT_PREFIX}bridge-${domain}`,
+  };
+}
+
+function authMatchesForDomain(domain) {
+  return [`*://${domain}/*`, `*://*.${domain}/*`];
+}
+
+async function registerAuthScriptsForDomain(domain) {
+  const ids = authScriptIdsForDomain(domain);
+  const matches = authMatchesForDomain(domain);
+
+  // Verify we actually hold host permission for this domain (dynamic
+  // content scripts require it). If not, skip — user can grant via popup.
+  const hasPerms = await chrome.permissions.contains({ origins: matches });
+  if (!hasPerms) {
+    console.log(`[CookieShare] Skipping content script registration for ${domain} — host permission not granted`);
+    return;
+  }
+
+  const scripts = [
+    {
+      id: ids.main,
+      js: ['content-main.js'],
+      matches,
+      runAt: 'document_start',
+      world: 'MAIN',
+      allFrames: false,
+    },
+    {
+      id: ids.bridge,
+      js: ['content-bridge.js'],
+      matches,
+      runAt: 'document_start',
+      world: 'ISOLATED',
+      allFrames: false,
+    },
+  ];
+
+  try {
+    // Unregister any existing ones first so we pick up code changes
+    await chrome.scripting.unregisterContentScripts({ ids: [ids.main, ids.bridge] }).catch(() => {});
+    await chrome.scripting.registerContentScripts(scripts);
+    console.log(`[CookieShare] Registered auth content scripts for ${domain}`);
+
+    // Back-inject into any already-open tabs so we don't have to wait for
+    // a navigation to arm the interceptor.
+    await injectAuthScriptsIntoOpenTabs(domain);
+  } catch (e) {
+    console.warn(`[CookieShare] Failed to register content scripts for ${domain}:`, e.message);
+  }
+}
+
+async function unregisterAuthScriptsForDomain(domain) {
+  const ids = authScriptIdsForDomain(domain);
+  try {
+    await chrome.scripting.unregisterContentScripts({ ids: [ids.main, ids.bridge] });
+  } catch {}
+}
+
+async function injectAuthScriptsIntoOpenTabs(domain) {
+  try {
+    const tabs = await chrome.tabs.query({});
+    for (const tab of tabs) {
+      if (!tab.id || !tab.url) continue;
+      let host;
+      try { host = new URL(tab.url).hostname; } catch { continue; }
+      if (host !== domain && !host.endsWith('.' + domain)) continue;
+
+      try {
+        await chrome.scripting.executeScript({
+          target: { tabId: tab.id },
+          files: ['content-main.js'],
+          world: 'MAIN',
+          injectImmediately: true,
+        });
+        await chrome.scripting.executeScript({
+          target: { tabId: tab.id },
+          files: ['content-bridge.js'],
+          world: 'ISOLATED',
+          injectImmediately: true,
+        });
+        console.log(`[CookieShare] Injected auth interceptor into open tab ${tab.id} (${host})`);
+      } catch (e) {
+        // Tab may be a chrome:// page or otherwise uninjectable
+        console.log(`[CookieShare] Could not inject into tab ${tab.id} (${host}): ${e.message}`);
+      }
+    }
+  } catch {}
+}
+
+async function reconcileAuthScripts() {
+  const domains = await getWatchedDomains();
+  for (const domain of domains) {
+    await registerAuthScriptsForDomain(domain);
+  }
+}
 
 // ============================================================
 // Data Collection
@@ -310,11 +457,12 @@ async function collectDomainData(domain) {
     console.warn(`[CookieSync] Could not read storage from ${domain} tab:`, e.message);
   }
 
-  // Collect any captured bearer tokens for this domain
-  const bearerTokens = {};
-  for (const [host, data] of Object.entries(capturedTokens)) {
+  // Collect any captured Authorization headers for this domain
+  const { [CAPTURED_AUTH_KEY]: stored = {} } = await chrome.storage.local.get(CAPTURED_AUTH_KEY);
+  const authHeaders = {};
+  for (const [host, data] of Object.entries(stored)) {
     if (host === domain || host.endsWith('.' + domain)) {
-      bearerTokens[host] = data;
+      authHeaders[host] = data;
     }
   }
 
@@ -326,9 +474,16 @@ async function collectDomainData(domain) {
     sessionStorage: sessionStorageData,
   };
 
-  if (Object.keys(bearerTokens).length > 0) {
-    result.bearerTokens = bearerTokens;
-    console.log(`[CookieShare] Including ${Object.keys(bearerTokens).length} bearer tokens for ${domain}`);
+  if (Object.keys(authHeaders).length > 0) {
+    result.authHeaders = authHeaders;
+    // Back-compat: keep bearerTokens key populated with legacy-shape entries
+    // for any consumers still reading that field.
+    const legacy = {};
+    for (const [host, data] of Object.entries(authHeaders)) {
+      legacy[host] = { token: data.token, capturedAt: data.capturedAt };
+    }
+    result.bearerTokens = legacy;
+    console.log(`[CookieShare] Including ${Object.keys(authHeaders).length} auth headers for ${domain}`);
   }
 
   return result;
@@ -452,12 +607,13 @@ chrome.alarms.onAlarm.addListener(async (alarm) => {
   }
 });
 
-// Set up periodic sync
+// Set up periodic sync + reconcile content scripts
 chrome.runtime.onInstalled.addListener(async () => {
   const config = await getConfig();
   chrome.alarms.create('periodic_sync', {
     periodInMinutes: config.periodicSyncMinutes,
   });
+  await reconcileAuthScripts();
 });
 
 chrome.runtime.onStartup.addListener(async () => {
@@ -465,14 +621,28 @@ chrome.runtime.onStartup.addListener(async () => {
   chrome.alarms.create('periodic_sync', {
     periodInMinutes: config.periodicSyncMinutes,
   });
+  await reconcileAuthScripts();
 });
 
-// Message handler — only accepts messages from our own extension pages
+// Also reconcile whenever the SW boots (e.g., after extension reload) — MV3
+// service workers can be spawned without firing onInstalled/onStartup.
+reconcileAuthScripts().catch(() => {});
+
+// Message handler — accepts messages from extension pages and, for the
+// narrowly-scoped `capturedAuth` type, from injected content scripts.
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
-  // Security: reject messages not from our extension
+  // Security: reject messages not from our own extension
   if (sender.id !== chrome.runtime.id) return;
-  // Security: reject messages from content scripts (tabs)
-  if (sender.tab) return;
+
+  // Content-script captures are the only message type allowed from tabs.
+  if (sender.tab) {
+    if (msg?.type === 'capturedAuth' && msg.url && msg.authValue) {
+      captureAuthHeader(msg.url, msg.authValue, 'contentScript').catch(() => {});
+      sendResponse({ ok: true });
+      return true;
+    }
+    return;
+  }
 
   const handler = messageHandlers[msg.type];
   if (handler) {
@@ -490,7 +660,10 @@ const messageHandlers = {
     }
     // Permission request happens in popup/options (requires user gesture context)
     const domains = await addWatchedDomain(domain);
-    console.log(`[CookieShare] Domain added, triggering interactive sync`);
+    console.log(`[CookieShare] Domain added, registering auth interceptor + triggering sync`);
+    // Register the auth-interceptor content scripts and inject into any
+    // already-open tabs. Do not await — first sync should not block on it.
+    registerAuthScriptsForDomain(domain).catch(() => {});
     // First sync is interactive (may need OAuth login)
     syncDomain(domain, true);
     return { domains };
@@ -498,6 +671,7 @@ const messageHandlers = {
 
   async removeDomain({ domain }) {
     const domains = await removeWatchedDomain(domain);
+    await unregisterAuthScriptsForDomain(domain);
     chrome.permissions.remove({
       origins: [`*://*.${domain}/*`, `*://${domain}/*`],
     }).catch(() => {});
