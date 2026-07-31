@@ -9,10 +9,17 @@ const $ = (sel) => document.querySelector(sel);
 document.addEventListener('DOMContentLoaded', async () => {
   await refresh();
 
-  // Load settings
+  // Load settings (project id falls back to the gitignored local-config.json
+  // so the committed source carries no private values).
   const { settings = {} } = await chrome.storage.local.get('settings');
-  $('#input-project').value = settings.gcpProjectId || '';
+  let localCfg = {};
+  try {
+    const r = await fetch(chrome.runtime.getURL('local-config.json'));
+    if (r.ok) localCfg = await r.json();
+  } catch {}
+  $('#input-project').value = settings.gcpProjectId || localCfg.gcpProjectId || '';
   $('#input-interval').value = settings.periodicSyncMinutes || 15;
+  $('#input-capture-incognito').checked = settings.captureIncognito === true;
 
   // Check auth status
   try {
@@ -30,6 +37,9 @@ document.addEventListener('DOMContentLoaded', async () => {
   $('#btn-sync-all').addEventListener('click', handleSyncAll);
   $('#btn-auth').addEventListener('click', handleAuth);
   $('#btn-save-settings').addEventListener('click', handleSaveSettings);
+  $('#btn-export').addEventListener('click', handleExport);
+  $('#btn-import').addEventListener('click', () => $('#import-file').click());
+  $('#import-file').addEventListener('change', handleImport);
 });
 
 // ============================================================
@@ -156,12 +166,42 @@ async function handleSaveSettings() {
   const settings = {
     gcpProjectId: $('#input-project').value.trim(),
     periodicSyncMinutes: parseInt($('#input-interval').value, 10) || 15,
+    captureIncognito: $('#input-capture-incognito').checked,
   };
   await chrome.storage.local.set({ settings });
+  await sendMessage({ type: 'settingsUpdated' }); // recreate the periodic alarm
 
   const btn = $('#btn-save-settings');
   btn.textContent = 'Saved';
   setTimeout(() => { btn.textContent = 'Save Settings'; }, 1500);
+}
+
+// Portable backup so a reinstall (which gets a new extension id and empty
+// storage) doesn't lose the watched-domain list + settings.
+async function handleExport() {
+  const { state } = await sendMessage({ type: 'exportState' });
+  const blob = new Blob([JSON.stringify(state, null, 2)], { type: 'application/json' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = 'cookie-share-state.json';
+  a.click();
+  URL.revokeObjectURL(url);
+}
+
+async function handleImport(e) {
+  const file = e.target.files?.[0];
+  if (!file) return;
+  try {
+    const state = JSON.parse(await file.text());
+    await sendMessage({ type: 'importState', state });
+    await refresh();
+    alert('Imported. Re-grant host permissions from the popup on each site if prompted.');
+  } catch (err) {
+    alert('Import failed: ' + err.message);
+  } finally {
+    e.target.value = '';
+  }
 }
 
 // ============================================================

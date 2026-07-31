@@ -36,6 +36,7 @@ document.addEventListener('DOMContentLoaded', async () => {
   $('#btn-sync-site').addEventListener('click', handleAddDomain);
   $('#btn-sync-now').addEventListener('click', handleSyncNow);
   $('#btn-remove').addEventListener('click', handleRemove);
+  $('#btn-refresh-now').addEventListener('click', handleRefreshNow);
   $('#link-options').addEventListener('click', (e) => {
     e.preventDefault();
     chrome.runtime.openOptionsPage();
@@ -67,14 +68,53 @@ function showWatchedState(domain, status) {
     $('#cookie-count').textContent = status.cookieCount ?? '—';
     const storageKeys = (status.localStorageKeys || 0) + (status.sessionStorageKeys || 0);
     $('#storage-count').textContent = storageKeys || '—';
+    $('#bearer-count').textContent = status.bearerTokenCount ?? '—';
 
     if (status.error) {
       $('#error-row').style.display = 'flex';
       $('#sync-error').textContent = status.error;
+    } else {
+      $('#error-row').style.display = 'none';
+      $('#sync-error').textContent = '';
     }
   }
 
   show('status-section');
+  refreshExpiryBanner(domain);
+}
+
+async function refreshExpiryBanner(domain) {
+  const banner = $('#expiry-banner');
+  if (!banner) return;
+  try {
+    const info = await sendMessage({ type: 'getDomainExpiry', domain });
+    if (!info || !info.earliestExpiryMs) {
+      banner.classList.add('hidden');
+      return;
+    }
+    const remainingMs = info.earliestExpiryMs - info.nowMs;
+    if (remainingMs >= info.warningThresholdMs) {
+      banner.classList.add('hidden');
+      return;
+    }
+    $('#expiry-detail').textContent = remainingMs <= 0
+      ? 'Expired — refresh to re-sync'
+      : `expires in ${formatDuration(remainingMs)}`;
+    banner.classList.remove('hidden');
+  } catch (e) {
+    console.warn('[CookieShare:popup] expiry check failed:', e.message);
+    banner.classList.add('hidden');
+  }
+}
+
+function formatDuration(ms) {
+  const totalSec = Math.floor(ms / 1000);
+  if (totalSec < 60) return `${totalSec}s`;
+  const min = Math.floor(totalSec / 60);
+  if (min < 60) return `${min}m`;
+  const hr = Math.floor(min / 60);
+  const rem = min % 60;
+  return rem ? `${hr}h ${rem}m` : `${hr}h`;
 }
 
 // ============================================================
@@ -87,11 +127,10 @@ async function handleAddDomain() {
   btn.disabled = true;
 
   try {
-    console.log(`[CookieShare:popup] Requesting host permission for ${currentDomain}`);
-    // Request host permission here (popup) — must be in user gesture context
-    const granted = await chrome.permissions.request({
-      origins: [`*://*.${currentDomain}/*`, `*://${currentDomain}/*`],
-    });
+    // Build origins list including parent domains for cookie access
+    const origins = getOriginsForDomain(currentDomain);
+    console.log(`[CookieShare:popup] Requesting host permissions for: ${origins.join(', ')}`);
+    const granted = await chrome.permissions.request({ origins });
     console.log(`[CookieShare:popup] Permission granted: ${granted}`);
     if (!granted) {
       btn.textContent = 'Permission denied';
@@ -138,6 +177,21 @@ async function handleSyncNow() {
   setButtonSpinner(btn);
   btn.disabled = true;
 
+  // Ensure we have permissions for parent domains (for cookie access). If the
+  // user declines, don't silently sync with missing access — tell them.
+  const origins = getOriginsForDomain(currentDomain);
+  let granted = await chrome.permissions.contains({ origins });
+  if (!granted) {
+    console.log(`[CookieShare:popup] Missing parent domain permissions, requesting...`);
+    granted = await chrome.permissions.request({ origins }).catch(() => false);
+  }
+  if (!granted) {
+    btn.textContent = 'Permission needed';
+    btn.disabled = false;
+    setTimeout(() => { btn.textContent = 'Sync Now'; }, 2000);
+    return;
+  }
+
   await sendMessage({ type: 'syncDomain', domain: currentDomain });
 
   const { statuses } = await sendMessage({ type: 'getStatus' });
@@ -152,9 +206,35 @@ async function handleRemove() {
   showAddState(currentDomain);
 }
 
+async function handleRefreshNow() {
+  const btn = $('#btn-refresh-now');
+  setButtonSpinner(btn, 'Refreshing...');
+  btn.disabled = true;
+  try {
+    await sendMessage({ type: 'syncDomain', domain: currentDomain });
+    const { statuses } = await sendMessage({ type: 'getStatus' });
+    showWatchedState(currentDomain, statuses[currentDomain]);
+  } catch (e) {
+    btn.textContent = 'Failed — retry';
+  } finally {
+    btn.disabled = false;
+    btn.textContent = 'Refresh now';
+  }
+}
+
 // ============================================================
 // Helpers
 // ============================================================
+
+function getOriginsForDomain(domain) {
+  const origins = [`*://*.${domain}/*`, `*://${domain}/*`];
+  const parts = domain.split('.');
+  for (let i = 1; i < parts.length - 1; i++) {
+    const parent = parts.slice(i).join('.');
+    origins.push(`*://*.${parent}/*`, `*://${parent}/*`);
+  }
+  return origins;
+}
 
 function extractDomain(url) {
   if (!url) return null;

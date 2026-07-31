@@ -15,3 +15,11 @@ node_modules/
 *.key
 *.pem
 *.env
+
+# Cookie Share — local private config (never commit)
+config.local.json
+extension/manifest.json
+extension/local-config.json
+
+# Session build artifacts / backups
+build/
