@@ -238,6 +238,7 @@ async function handleMessage(msg) {
       }
       await ensurePeriodicAlarm(true);
       await ensureActiveTabAlarm();
+      registerWebRequestForWatched();
       return { ok: true, domains: await getDomains() };
     }
 
@@ -311,11 +312,34 @@ async function getSettings() {
 // Auth header capture from network requests
 // ============================================================
 
-chrome.webRequest.onBeforeSendHeaders.addListener(
-  (details) => { captureFromRequest(details).catch(() => {}); },
-  { urls: ['<all_urls>'] },
-  ['requestHeaders', 'extraHeaders']
-);
+// Register a webRequest listener scoped to exactly the watched domains we hold
+// host permission for. A static <all_urls> listener warns "You need to request
+// host permissions" because the extension only holds per-domain optional grants
+// (and would observe nothing until one is granted anyway).
+let webRequestListener = null;
+async function registerWebRequestForWatched() {
+  if (webRequestListener) {
+    chrome.webRequest.onBeforeSendHeaders.removeListener(webRequestListener);
+    webRequestListener = null;
+  }
+  const domains = await getDomains();
+  const urls = [];
+  for (const d of domains) {
+    const origins = [`*://${d}/*`, `*://*.${d}/*`];
+    try { if (await chrome.permissions.contains({ origins })) urls.push(...origins); } catch {}
+  }
+  if (!urls.length) return;
+  webRequestListener = (details) => { captureFromRequest(details).catch(() => {}); };
+  chrome.webRequest.onBeforeSendHeaders.addListener(
+    webRequestListener, { urls }, ['requestHeaders', 'extraHeaders']
+  );
+  console.log(`[CookieShare:bg] webRequest capture armed for ${urls.length / 2} domain(s)`);
+}
+
+// Re-arm whenever host permissions or the watched set change.
+if (chrome.permissions?.onAdded) chrome.permissions.onAdded.addListener(() => registerWebRequestForWatched());
+if (chrome.permissions?.onRemoved) chrome.permissions.onRemoved.addListener(() => registerWebRequestForWatched());
+hydrationDone.then(registerWebRequestForWatched).catch(() => {});
 
 async function captureFromRequest(details) {
   if (details.incognito) {
@@ -772,7 +796,32 @@ async function extractStorageContent() {
     } catch { /* ignore */ }
   }
 
-  return { localStorage: snapshotStore(localStorage), sessionStorage: snapshotStore(sessionStorage), indexedDB: idbResult };
+  // Slack: the per-workspace API token (xoxc-) lives inside localConfig_v2,
+  // whose key matches no auth pattern and whose value is far over the 4KB cap —
+  // so it was always dropped and Slack sessions synced as cookie-only (the `d`
+  // cookie alone gets `not_authed` from Slack's API). Extract just the tokens
+  // rather than storing the whole multi-KB config blob.
+  function slackTokens() {
+    const out = {};
+    try {
+      if (!/(^|\.)slack\.com$/.test(location.hostname)) return out;
+      const raw = localStorage.getItem('localConfig_v2');
+      if (!raw) return out;
+      const teams = (JSON.parse(raw) || {}).teams || {};
+      for (const t of Object.values(teams)) {
+        if (t && typeof t.token === 'string' && t.token.startsWith('xox')) {
+          out[t.domain || t.name || t.id || 'unknown'] = t.token;
+        }
+      }
+    } catch { /* malformed config — leave empty */ }
+    return out;
+  }
+
+  const ls = snapshotStore(localStorage);
+  const slack = slackTokens();
+  if (Object.keys(slack).length) ls.__cookieshare_slack_tokens__ = JSON.stringify(slack);
+
+  return { localStorage: ls, sessionStorage: snapshotStore(sessionStorage), indexedDB: idbResult };
 }
 
 // ============================================================
