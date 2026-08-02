@@ -23,3 +23,4 @@ extension/local-config.json
 
 # Session build artifacts / backups
 build/
+extension-key.pem

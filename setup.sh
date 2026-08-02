@@ -21,11 +21,15 @@ fi
 CLIENT_ID=$(python3 -c "import json;print(json.load(open('$CONFIG'))['oauth_client_id'])")
 PROJECT_ID=$(python3 -c "import json;print(json.load(open('$CONFIG'))['gcp_project_id'])")
 
-python3 - "$TEMPLATE" "$MANIFEST" "$CLIENT_ID" <<'PY'
+python3 - "$TEMPLATE" "$MANIFEST" "$CLIENT_ID" "$CONFIG" <<'PY'
 import json, sys
-template, out, client_id = sys.argv[1], sys.argv[2], sys.argv[3]
+template, out, client_id, cfg_path = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
 m = json.load(open(template))
 m['oauth2']['client_id'] = client_id
+cfg = json.load(open(cfg_path))
+# Pin a stable extension id so reloads / path changes never re-mint it.
+if cfg.get('extension_key'):
+    m['key'] = cfg['extension_key']
 json.dump(m, open(out, 'w'), indent=2); open(out, 'a').write('\n')
 PY
 
