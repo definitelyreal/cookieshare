@@ -238,7 +238,7 @@ async function handleMessage(msg) {
       }
       await ensurePeriodicAlarm(true);
       await ensureActiveTabAlarm();
-      registerWebRequestForWatched();
+      registerWebRequestForWatched().catch(() => {});
       return { ok: true, domains: await getDomains() };
     }
 
@@ -410,14 +410,19 @@ chrome.cookies.onChanged.addListener(async (changeInfo) => {
 // Alarms
 // ============================================================
 
-chrome.alarms.onAlarm.addListener(async (alarm) => {
-  if (alarm.name === PERIODIC_ALARM) { await syncAll(); return; }
-  if (alarm.name === ACTIVE_TAB_ALARM) { await refreshActiveWatchedDomains(); return; }
-  if (alarm.name.startsWith('sync-')) {
-    const domain = alarm.name.slice(5);
-    await syncDomain(domain); // background context → non-interactive auth
-  }
+chrome.alarms.onAlarm.addListener((alarm) => {
+  // Never let a sync rejection escape the listener as an uncaught rejection —
+  // background sync failures (auth, network) are logged, not thrown.
+  runAlarm(alarm).catch(err => console.warn(`[CookieShare:bg] Alarm ${alarm.name} failed:`, err.message));
 });
+
+async function runAlarm(alarm) {
+  if (alarm.name === PERIODIC_ALARM) return syncAll();
+  if (alarm.name === ACTIVE_TAB_ALARM) return refreshActiveWatchedDomains();
+  if (alarm.name.startsWith('sync-')) {
+    return syncDomain(alarm.name.slice(5)); // background context → non-interactive auth
+  }
+}
 
 // ============================================================
 // Tab listeners: post-load refresh + badge
