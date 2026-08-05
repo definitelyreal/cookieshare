@@ -129,10 +129,15 @@ async function handleAddDomain() {
   try {
     // Build origins list including parent domains for cookie access
     const origins = getOriginsForDomain(currentDomain);
+    // Record intent BEFORE the prompt: the Chrome permission dialog closes this
+    // popup, so the background finishes the add via permissions.onAdded if we
+    // don't survive the await. No re-click needed.
+    await chrome.storage.local.set({ pendingAdd: currentDomain });
     console.log(`[CookieShare:popup] Requesting host permissions for: ${origins.join(', ')}`);
     const granted = await chrome.permissions.request({ origins });
     console.log(`[CookieShare:popup] Permission granted: ${granted}`);
     if (!granted) {
+      await chrome.storage.local.remove('pendingAdd');
       btn.textContent = 'Permission denied';
       setTimeout(() => {
         btn.textContent = 'Sync This Site';
@@ -141,7 +146,7 @@ async function handleAddDomain() {
       return;
     }
 
-    // Permission granted — tell background to add domain and start syncing
+    // Popup survived (permission already held, or Chrome kept it open) — finish here too.
     console.log(`[CookieShare:popup] Sending addDomain message`);
     const resp = await sendMessage({ type: 'addDomain', domain: currentDomain });
     console.log(`[CookieShare:popup] addDomain response:`, resp);

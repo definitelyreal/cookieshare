@@ -25,7 +25,7 @@ global.chrome = {
   cookies: { onChanged: listener, getAll: async () => [] },
   tabs: { onUpdated: listener, onActivated: listener, query: async () => [] },
   alarms: { onAlarm: listener, get: async () => null, create: noop, clear: async (n) => { spies.alarmsCleared.push(n); } },
-  permissions: { remove: async (o) => { spies.permsRemoved.push(o); return true; } },
+  permissions: { remove: async (o) => { spies.permsRemoved.push(o); return true; }, contains: async () => true, onAdded: listener, onRemoved: listener },
   action: { setBadgeText: noop, setBadgeBackgroundColor: noop },
   identity: { getAuthToken: async () => ({ token: 'T' }), removeCachedAuthToken: async () => {} },
   scripting: {},
@@ -78,6 +78,22 @@ async function test(name, fn) {
     const res = await bg.handleMessage({ type: 'importState', state });
     assert.deepStrictEqual(res.domains, ['a.com', 'b.com'], 'domains restored');
     assert.strictEqual(store.settings.periodicSyncMinutes, 30, 'settings restored');
+  });
+
+  await test('completePendingAdd adds the pending domain + syncs after a permission grant (no re-click)', async () => {
+    for (const k of Object.keys(store)) delete store[k];
+    store.domains = [];
+    store.pendingAdd = 'newsite.org';
+    await bg.completePendingAdd();
+    assert.deepStrictEqual(store.domains, ['newsite.org'], 'domain auto-added');
+    assert.ok(!('pendingAdd' in store), 'pending flag cleared');
+  });
+
+  await test('completePendingAdd is a no-op when there is no pending add', async () => {
+    for (const k of Object.keys(store)) delete store[k];
+    store.domains = ['a.com'];
+    await bg.completePendingAdd();
+    assert.deepStrictEqual(store.domains, ['a.com'], 'nothing added');
   });
 
   console.log(`\n${passed} passed, ${failed} failed`);

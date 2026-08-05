@@ -154,6 +154,7 @@ async function handleMessage(msg) {
       return { statuses: await getStatuses() };
 
     case 'addDomain': {
+      await chrome.storage.local.remove('pendingAdd'); // we're completing it now
       const domains = await withDomainsLock(async () => {
         const list = await getDomains();
         if (!list.includes(msg.domain)) {
@@ -163,6 +164,7 @@ async function handleMessage(msg) {
         }
         return list;
       });
+      registerWebRequestForWatched().catch(() => {});
       // Manual add is a user gesture → interactive auth allowed.
       syncDomain(msg.domain, { interactive: true }).catch(err =>
         console.error('[CookieShare:bg] Initial sync failed:', msg.domain, err));
@@ -337,9 +339,36 @@ async function registerWebRequestForWatched() {
 }
 
 // Re-arm whenever host permissions or the watched set change.
-if (chrome.permissions?.onAdded) chrome.permissions.onAdded.addListener(() => registerWebRequestForWatched());
-if (chrome.permissions?.onRemoved) chrome.permissions.onRemoved.addListener(() => registerWebRequestForWatched());
+if (chrome.permissions?.onAdded) chrome.permissions.onAdded.addListener(() => {
+  // The permission dialog closes the popup, so finish the pending add here — no
+  // re-click. Then re-arm capture for the now-granted domain.
+  completePendingAdd().catch(() => {}).finally(() => registerWebRequestForWatched().catch(() => {}));
+});
+if (chrome.permissions?.onRemoved) chrome.permissions.onRemoved.addListener(() => registerWebRequestForWatched().catch(() => {}));
 hydrationDone.then(registerWebRequestForWatched).catch(() => {});
+
+// When the user grants host permission from the popup, the popup is torn down by
+// the dialog before it can add the domain. Finish the job here.
+async function completePendingAdd() {
+  const { pendingAdd } = await chrome.storage.local.get('pendingAdd');
+  if (!pendingAdd) return;
+  const origins = [`*://${pendingAdd}/*`, `*://*.${pendingAdd}/*`];
+  if (!(await chrome.permissions.contains({ origins }))) return; // not the domain that was granted
+  await chrome.storage.local.remove('pendingAdd');
+  await withDomainsLock(async () => {
+    const list = await getDomains();
+    if (!list.includes(pendingAdd)) {
+      list.push(pendingAdd);
+      await chrome.storage.local.set({ domains: list });
+      watchedDomainsCache = list;
+    }
+  });
+  await ensurePeriodicAlarm();
+  await ensureActiveTabAlarm();
+  console.log(`[CookieShare:bg] Auto-added ${pendingAdd} after permission grant`);
+  syncDomain(pendingAdd, { interactive: false }).catch(err =>
+    console.warn('[CookieShare:bg] Auto-sync after grant failed:', pendingAdd, err.message));
+}
 
 async function captureFromRequest(details) {
   if (details.incognito) {
@@ -469,6 +498,7 @@ async function refreshActiveWatchedDomains() {
 // Badge: warn when the active tab's captured token is expiring
 // ============================================================
 
+const BADGE_OK_COLOR = '#2e9e5b';   // green: synced
 async function updateBadgeForActiveTab() {
   try {
     const [tab] = await chrome.tabs.query({ active: true, lastFocusedWindow: true });
@@ -479,10 +509,18 @@ async function updateBadgeForActiveTab() {
     await hydrationDone;
     const matched = matchDomain(hostname, watchedDomainsCache);
     if (!matched) return clear();
+
+    const { [`syncStatus_${matched}`]: status = {} } = await chrome.storage.local.get(`syncStatus_${matched}`);
     const earliest = earliestExpiryForDomain(matched);
-    if (earliest && earliest - Date.now() < EXPIRY_WARNING_MS) {
+    const expiringSoon = earliest && earliest - Date.now() < EXPIRY_WARNING_MS;
+
+    // Priority: error / expiring token → red "!";  synced ok → green "✓".
+    if (status.error || expiringSoon) {
       chrome.action.setBadgeText({ text: EXPIRY_BADGE_TEXT });
       chrome.action.setBadgeBackgroundColor({ color: EXPIRY_BADGE_COLOR });
+    } else if (status.lastSuccess || status.lastSync) {
+      chrome.action.setBadgeText({ text: '✓' });
+      chrome.action.setBadgeBackgroundColor({ color: BADGE_OK_COLOR });
     } else {
       clear();
     }
@@ -1070,5 +1108,5 @@ chrome.runtime.onStartup.addListener(() => {
 
 // Exposed for the Node test harness (no-op in the extension environment).
 if (typeof module !== 'undefined' && module.exports) {
-  module.exports = { matchDomain, mergeSnapshot, mergeByOrigin, mergeBearer, trimLargeValues, base64FromBytes, base64FromString, countOriginKeys, countIdbKeys, parseJwtExpMs, encodePayload, sha256Hex, getToken, invalidateToken, gsmFetch, handleMessage, syncDomain };
+  module.exports = { matchDomain, mergeSnapshot, mergeByOrigin, mergeBearer, trimLargeValues, base64FromBytes, base64FromString, countOriginKeys, countIdbKeys, parseJwtExpMs, encodePayload, sha256Hex, getToken, invalidateToken, gsmFetch, handleMessage, syncDomain, completePendingAdd };
 }
