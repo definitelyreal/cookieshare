@@ -2,55 +2,49 @@
 <html>
 <head>
   <meta charset="utf-8">
-  <title>Cookie Share — Settings</title>
+  <title>Cookie Share — Options</title>
   <link rel="stylesheet" href="options.css">
 </head>
 <body>
   <div id="app">
     <header>
       <h1>Cookie Share</h1>
-      <p class="subtitle">Manage synced domains and settings</p>
+      <p class="subtitle">Sync browser sessions to Google Secret Manager</p>
     </header>
 
-    <!-- Auth status -->
+    <!-- Auth warning banner -->
     <div id="auth-banner" class="banner hidden">
-      <span>Not authenticated with Google Cloud.</span>
+      <span>Not signed in to Google</span>
       <button id="btn-auth" class="btn btn-small">Sign In</button>
     </div>
 
-    <!-- Domains table -->
+    <!-- Watched Domains -->
     <section>
       <div class="section-header">
         <h2>Watched Domains</h2>
         <button id="btn-sync-all" class="btn btn-small">Sync All</button>
       </div>
 
-      <table id="domains-table">
+      <table>
         <thead>
           <tr>
             <th>Domain</th>
             <th>Cookies</th>
-            <th>Storage Keys</th>
+            <th>Storage</th>
             <th>Last Sync</th>
             <th>Status</th>
             <th></th>
           </tr>
         </thead>
-        <tbody id="domains-body">
-          <!-- Populated by JS -->
-        </tbody>
+        <tbody id="domains-body"></tbody>
       </table>
 
       <div id="empty-state" class="empty hidden">
-        No domains being watched. Visit a website and click the extension icon to add one.
+        No domains watched yet. Add one below or use the popup on any site.
       </div>
-    </section>
 
-    <!-- Add domain manually -->
-    <section>
-      <h2>Add Domain</h2>
-      <div class="input-row">
-        <input type="text" id="input-domain" placeholder="e.g. github.com">
+      <div class="input-row" style="margin-top: 12px">
+        <input type="text" id="input-domain" placeholder="example.com">
         <button id="btn-add" class="btn btn-primary">Add</button>
       </div>
     </section>
@@ -59,14 +53,27 @@
     <section>
       <h2>Settings</h2>
       <div class="setting-row">
-        <label for="input-project">GCP Project ID</label>
-        <input type="text" id="input-project" placeholder="my-gcp-project-id">
+        <label>GCP Project ID</label>
+        <input type="text" id="input-project" placeholder="my-project-123">
       </div>
       <div class="setting-row">
-        <label for="input-interval">Sync interval (minutes)</label>
-        <input type="number" id="input-interval" min="5" max="60" value="15">
+        <label>Sync interval (minutes)</label>
+        <input type="number" id="input-interval" min="1" max="1440" value="15">
       </div>
-      <button id="btn-save-settings" class="btn btn-secondary">Save Settings</button>
+      <div class="setting-row">
+        <label>Capture from incognito tabs</label>
+        <input type="checkbox" id="input-capture-incognito">
+      </div>
+      <button id="btn-save-settings" class="btn btn-secondary" style="margin-top: 8px">Save Settings</button>
+
+      <div class="setting-row" style="margin-top: 16px">
+        <label>Backup / restore setup</label>
+        <span>
+          <button id="btn-export" class="btn btn-small">Export</button>
+          <button id="btn-import" class="btn btn-small">Import</button>
+          <input type="file" id="import-file" accept="application/json" style="display:none">
+        </span>
+      </div>
     </section>
   </div>
   <script src="options.js"></script>

@@ -1,0 +1,5 @@
+{
+  "oauth_client_id": "YOUR_CLIENT_ID_HERE.apps.googleusercontent.com",
+  "gcp_project_id": "your-gcp-project-id",
+  "extension_key": ""
+}

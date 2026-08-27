@@ -10,30 +10,43 @@
       <h1>Cookie Share</h1>
     </header>
 
-    <!-- State: current site not watched -->
+    <!-- State: current site not watched yet -->
     <div id="add-section" class="section hidden">
       <div class="site-name" id="current-domain"></div>
       <button id="btn-sync-site" class="btn btn-primary">Sync This Site</button>
     </div>
 
-    <!-- State: current site already watched -->
+    <!-- State: current site is watched -->
     <div id="status-section" class="section hidden">
       <div class="site-name" id="watched-domain"></div>
+
+      <div id="expiry-banner" class="expiry-banner hidden">
+        <div class="expiry-text">
+          <span class="expiry-title">Auth expiring</span>
+          <span class="expiry-detail" id="expiry-detail"></span>
+        </div>
+        <button id="btn-refresh-now" class="btn btn-warning">Refresh now</button>
+      </div>
+
       <div class="status-row">
         <span class="label">Last sync</span>
-        <span id="last-sync" class="value">—</span>
+        <span class="value" id="last-sync">—</span>
       </div>
       <div class="status-row">
         <span class="label">Cookies</span>
-        <span id="cookie-count" class="value">—</span>
+        <span class="value" id="cookie-count">—</span>
       </div>
       <div class="status-row">
         <span class="label">Storage keys</span>
-        <span id="storage-count" class="value">—</span>
+        <span class="value" id="storage-count">—</span>
       </div>
-      <div class="status-row" id="error-row" style="display:none">
+      <div class="status-row">
+        <span class="label">Bearer tokens</span>
+        <span class="value" id="bearer-count">—</span>
+      </div>
+      <div id="error-row" class="status-row" style="display:none">
         <span class="label">Error</span>
-        <span id="sync-error" class="value error">—</span>
+        <span class="value error" id="sync-error"></span>
       </div>
       <div class="btn-row">
         <button id="btn-sync-now" class="btn btn-secondary">Sync Now</button>
@@ -41,16 +54,14 @@
       </div>
     </div>
 
-    <!-- State: no tab / chrome:// page -->
+    <!-- State: no usable site (chrome://, new tab, etc.) -->
     <div id="no-site-section" class="section hidden">
-      <p class="muted">Navigate to a website to sync it.</p>
+      <p class="muted">Navigate to a site to sync its session.</p>
     </div>
 
     <footer>
-      <div class="footer-stats">
-        <span id="domain-count">0</span> sites synced
-      </div>
-      <a href="#" id="link-options">Manage Sites</a>
+      <span class="footer-stats"><span id="domain-count">0</span> sites watched</span>
+      <a href="#" id="link-options">Options</a>
     </footer>
   </div>
   <script src="popup.js"></script>

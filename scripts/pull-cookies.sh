@@ -7,6 +7,9 @@
 #   --auth-only        Output just the captured Authorization headers map
 #   --token [<host>]   Output just the raw Authorization header value
 #                      (picks the domain's host if --token has no argument)
+#   --slack [<team>]   Output "<xoxc-token>\t<xoxd-cookie>" for a Slack workspace
+#                      (the pair slackdump/slack-api clients need; team defaults
+#                      to the first captured workspace)
 #
 # Handles both compressed (gzip) and uncompressed payloads.
 #
@@ -24,6 +27,8 @@ COOKIES_ONLY=false
 AUTH_ONLY=false
 TOKEN_MODE=false
 TOKEN_HOST=""
+SLACK_MODE=false
+SLACK_TEAM=""
 
 # Parse arguments
 while [[ $# -gt 0 ]]; do
@@ -50,6 +55,14 @@ while [[ $# -gt 0 ]]; do
           TOKEN_HOST="$1"
           shift
         fi
+      fi
+      ;;
+    --slack)
+      SLACK_MODE=true
+      shift
+      if [[ $# -gt 0 && "$1" != -* && "$1" != *.* ]]; then
+        SLACK_TEAM="$1"
+        shift
       fi
       ;;
     -*)
@@ -101,6 +114,31 @@ if [[ "$COOKIES_ONLY" == true ]]; then
   echo "$DATA" | jq '.cookies'
 elif [[ "$AUTH_ONLY" == true ]]; then
   echo "$DATA" | jq '.authHeaders // .bearerTokens // {}'
+elif [[ "$SLACK_MODE" == true ]]; then
+  # xoxc token: extracted by the extension from localConfig_v2 into a compact
+  # synthetic localStorage key (the raw config is far over the size cap).
+  TOK=$(echo "$DATA" | jq -r --arg t "$SLACK_TEAM" '
+    ((.localStorage // {}) | to_entries
+      | map(select(.value.__cookieshare_slack_tokens__))
+      | .[0].value.__cookieshare_slack_tokens__ // empty) as $raw
+    | if $raw == null or $raw == "" then empty
+      else ($raw | fromjson) as $m
+        | if $t == "" then ($m | to_entries | .[0].value) else ($m[$t] // empty) end
+      end')
+  CK=$(echo "$DATA" | jq -r '(.cookies // []) | map(select(.name == "d")) | .[0].value // empty')
+  if [[ -z "$CK" ]]; then
+    echo "Error: no 'd' cookie in secret '$SECRET_ID' — is the Slack session synced?" >&2
+    exit 1
+  fi
+  if [[ -z "$TOK" ]]; then
+    echo "Error: no xoxc token captured for '$SECRET_ID'." >&2
+    echo "The extension only captures it while a Slack tab is OPEN in Chrome (and needs" >&2
+    echo "extension >= 1.3.0, which extracts it from localConfig_v2). Open Slack in Chrome," >&2
+    echo "let a sync run, then retry. Available teams:" >&2
+    echo "$DATA" | jq -r '((.localStorage // {}) | to_entries | map(select(.value.__cookieshare_slack_tokens__)) | .[0].value.__cookieshare_slack_tokens__ // "{}") | fromjson | keys[]' >&2
+    exit 1
+  fi
+  printf '%s\t%s\n' "$TOK" "$CK"
 elif [[ "$TOKEN_MODE" == true ]]; then
   HOST="${TOKEN_HOST:-$DOMAIN}"
   # Prefer new authHeaders.raw; fall back to legacy bearerTokens.token

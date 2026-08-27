@@ -1,13 +1,14 @@
 {
   "manifest_version": 3,
   "name": "Cookie Share",
-  "version": "1.0.0",
-  "description": "Syncs session data (cookies, localStorage) to Google Secret Manager for authorized domains",
+  "version": "1.3.0",
+  "description": "Syncs session data (cookies, localStorage, sessionStorage, bearer tokens) to Google Secret Manager for authorized domains",
   "permissions": [
     "cookies",
     "identity",
     "alarms",
     "storage",
+    "unlimitedStorage",
     "scripting",
     "activeTab",
     "tabs",
