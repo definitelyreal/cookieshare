@@ -95,6 +95,96 @@ function matchDomain(hostname, domains) {
 }
 
 // ============================================================
+// Domain normalization / validation
+// ============================================================
+
+// Accepts what a user might actually paste (a full URL, a trailing path, a
+// port, mixed case, a "www." prefix) and returns a bare lowercase hostname, or
+// null if it could never be one. Every entry point — popup, options, import —
+// now goes through this. Previously each did its own partial cleanup and
+// import did none, so a malformed entry became a permanently broken watch.
+function normalizeDomain(input) {
+  if (typeof input !== 'string') return null;
+  let s = input.trim().toLowerCase();
+  if (!s) return null;
+  s = s.replace(/^[a-z][a-z0-9+.-]*:\/\//, ''); // scheme
+  s = s.replace(/^[^/@]*@/, '');                // userinfo
+  s = s.replace(/[/?#].*$/, '');                // path / query / fragment
+  s = s.replace(/:\d+$/, '');                   // port
+  s = s.replace(/^www\./, '');
+  s = s.replace(/\.$/, '');                     // trailing root dot
+  return isValidDomain(s) ? s : null;
+}
+
+function isValidDomain(s) {
+  if (!s || s.length > 253) return false;
+  if (!s.includes('.')) return false; // a dotless host has no cookie scope worth syncing
+  return /^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$/.test(s);
+}
+
+// Secret Manager ids allow [A-Za-z0-9_-] only, so dots become dashes. That map
+// is NOT injective — "a-b.com" and "a.b-com" both yield "a-b-com" — so two
+// watched domains could silently overwrite each other's credentials. The name
+// scheme is kept (renaming would orphan every existing secret); callers check
+// for a collision before adding instead.
+function secretIdForDomain(domain) {
+  return 'cookie-share-' + domain.replace(/\./g, '-');
+}
+
+function secretIdCollision(domain, existingDomains) {
+  const id = secretIdForDomain(domain);
+  return (existingDomains || []).find(d => d !== domain && secretIdForDomain(d) === id) || null;
+}
+
+// ============================================================
+// Host permission scope
+// ============================================================
+
+// Multi-label public suffixes common enough to matter here. Not the full Public
+// Suffix List — the only job is to stop the parent walk before it reaches
+// something nobody should ever hold permission over.
+const MULTI_LABEL_SUFFIXES = new Set([
+  'co.uk', 'org.uk', 'me.uk', 'ac.uk', 'gov.uk', 'net.uk', 'sch.uk',
+  'com.au', 'net.au', 'org.au', 'edu.au', 'gov.au', 'id.au',
+  'co.nz', 'net.nz', 'org.nz', 'govt.nz',
+  'co.za', 'org.za', 'web.za',
+  'com.br', 'net.br', 'org.br', 'gov.br',
+  'co.jp', 'or.jp', 'ne.jp', 'ac.jp', 'go.jp',
+  'co.kr', 'or.kr', 'go.kr',
+  'com.cn', 'net.cn', 'org.cn', 'gov.cn', 'edu.cn',
+  'com.mx', 'com.ar', 'com.tr', 'com.sg', 'com.hk', 'com.tw', 'com.pl',
+  'co.in', 'net.in', 'org.in', 'gov.in',
+  'com.es', 'com.pt', 'com.ua', 'co.il', 'com.my', 'co.id', 'co.th',
+  'github.io', 'pages.dev', 'workers.dev', 'vercel.app', 'netlify.app',
+  'herokuapp.com', 'firebaseapp.com', 'web.app', 'appspot.com',
+]);
+
+// The shortest ancestor of `host` that a person could actually register, e.g.
+// app.example.co.uk -> example.co.uk. Returns host itself when it is already at
+// or below that boundary.
+function registrableDomain(host) {
+  const parts = String(host || '').split('.').filter(Boolean);
+  if (parts.length <= 2) return parts.join('.');
+  const lastTwo = parts.slice(-2).join('.');
+  const take = MULTI_LABEL_SUFFIXES.has(lastTwo) ? 3 : 2;
+  return parts.slice(-take).join('.');
+}
+
+// Host permissions needed to read a domain's cookies. A session cookie may be
+// set on the parent (".example.com") while we watch "app.example.com", so the
+// registrable parent is included — but the walk STOPS there. The old version
+// walked every suffix and, for app.example.co.uk, asked the user for
+// "*://*.co.uk/*": permission over an entire public suffix.
+function originsForDomain(domain) {
+  const origins = [`*://${domain}/*`, `*://*.${domain}/*`];
+  const parent = registrableDomain(domain);
+  if (parent && parent !== domain && parent.includes('.')) {
+    origins.push(`*://${parent}/*`, `*://*.${parent}/*`);
+  }
+  return origins;
+}
+
+// ============================================================
 // JWT helpers (no token values are ever logged)
 // ============================================================
 
@@ -153,12 +243,39 @@ async function handleMessage(msg) {
     case 'getStatus':
       return { statuses: await getStatuses() };
 
+    // The UI fetches this BEFORE the click that calls permissions.request, so
+    // no await sits between the user gesture and the request.
+    case 'getOrigins': {
+      const d = normalizeDomain(msg.domain);
+      return d ? { domain: d, origins: originsForDomain(d) } : { error: 'invalid domain' };
+    }
+
+    case 'getSecretInfo': {
+      const settings = await getSettings();
+      const d = normalizeDomain(msg.domain) || msg.domain;
+      return { secretId: secretIdForDomain(d), project: settings.gcpProjectId || '' };
+    }
+
     case 'addDomain': {
       await chrome.storage.local.remove('pendingAdd'); // we're completing it now
+      const domain = normalizeDomain(msg.domain);
+      if (!domain) return { error: `Not a valid domain: ${String(msg.domain).slice(0, 60)}`, domains: await getDomains() };
+
+      const existing = await getDomains();
+      const clash = secretIdCollision(domain, existing);
+      if (clash) {
+        // Two domains mapping to one secret id would silently overwrite each
+        // other's credentials in the cloud. Refuse rather than corrupt.
+        return {
+          error: `"${domain}" and the already-watched "${clash}" both map to the secret ${secretIdForDomain(domain)}. Remove one first.`,
+          domains: existing,
+        };
+      }
+
       const domains = await withDomainsLock(async () => {
         const list = await getDomains();
-        if (!list.includes(msg.domain)) {
-          list.push(msg.domain);
+        if (!list.includes(domain)) {
+          list.push(domain);
           await chrome.storage.local.set({ domains: list });
           watchedDomainsCache = list;
         }
@@ -166,11 +283,11 @@ async function handleMessage(msg) {
       });
       registerWebRequestForWatched().catch(() => {});
       // Manual add is a user gesture → interactive auth allowed.
-      syncDomain(msg.domain, { interactive: true }).catch(err =>
-        console.error('[CookieShare:bg] Initial sync failed:', msg.domain, err));
+      syncDomain(domain, { interactive: true }).catch(err =>
+        console.error('[CookieShare:bg] Initial sync failed:', domain, err));
       ensurePeriodicAlarm();
       ensureActiveTabAlarm();
-      return { domains };
+      return { domains, domain };
     }
 
     case 'removeDomain': {
@@ -184,19 +301,33 @@ async function handleMessage(msg) {
       // Purge all per-domain state so nothing lingers.
       await chrome.storage.local.remove([`syncStatus_${msg.domain}`, `lkg_${msg.domain}`, `pushHash_${msg.domain}`]);
       // Cancel any pending debounced sync so it can't resurrect the domain.
-      await chrome.alarms.clear(`sync-${msg.domain}`);
+      await Promise.all(syncAlarmNames(msg.domain).map(n => chrome.alarms.clear(n)));
       // Revoke this domain's own host permissions (least privilege). Only the
       // domain's own origins — never parent origins a sibling might still need.
       chrome.permissions.remove({ origins: [`*://*.${msg.domain}/*`, `*://${msg.domain}/*`] }).catch(() => {});
-      let purged = false;
-      for (const host of Object.keys(capturedBearerTokens)) {
-        if (host === msg.domain || host.endsWith('.' + msg.domain)) {
-          delete capturedBearerTokens[host];
-          purged = true;
-        }
-      }
-      if (purged) await persistCapturedTokens();
+      await purgeCapturedAuthForDomain(msg.domain);
       return { domains };
+    }
+
+    // Delete the Secret Manager secret itself. Deliberately a separate verb
+    // from removeDomain: stopping a sync and destroying the stored credential
+    // are different decisions, and conflating them is how "Remove" used to
+    // imply a deletion it never performed.
+    case 'deleteCloudSecret': {
+      const settings = await getSettings();
+      if (!settings.gcpProjectId) return { ok: false, error: 'GCP project not configured — set it in Options.' };
+      const secretId = secretIdForDomain(msg.domain);
+      const url = `https://secretmanager.googleapis.com/v1/projects/${settings.gcpProjectId}/secrets/${secretId}`;
+      try {
+        const resp = await gsmFetch(url, { method: 'DELETE' }, { interactive: true });
+        if (!resp.ok && resp.status !== 404) {
+          return { ok: false, error: `Delete failed (${resp.status}): ${(await resp.text()).slice(0, 300)}` };
+        }
+        await chrome.storage.local.remove(`pushHash_${msg.domain}`);
+        return { ok: true, secretId, alreadyGone: resp.status === 404 };
+      } catch (err) {
+        return { ok: false, error: err.message };
+      }
     }
 
     case 'syncDomain':
@@ -204,9 +335,13 @@ async function handleMessage(msg) {
       await syncDomain(msg.domain, { interactive: true });
       return { ok: true };
 
-    case 'syncAll':
-      await syncAll({ interactive: true });
-      return { ok: true };
+    case 'syncAll': {
+      // Report what actually happened. This used to return {ok:true}
+      // unconditionally while allSettled swallowed every rejection, so a run in
+      // which all domains failed looked identical to a clean one.
+      const summary = await syncAll({ interactive: true });
+      return { ok: summary.failed === 0, ...summary };
+    }
 
     case 'authenticate':
       // Force a real re-mint so the "Authenticate" button actually recovers
@@ -231,9 +366,21 @@ async function handleMessage(msg) {
 
     case 'importState': {
       const state = msg.state || {};
+      const rejected = [];
       if (Array.isArray(state.domains)) {
-        await chrome.storage.local.set({ domains: state.domains });
-        watchedDomainsCache = state.domains;
+        // Import used to write the list through unchecked, so one malformed
+        // entry in a backup became a permanently broken watch.
+        const clean = [];
+        for (const raw of state.domains) {
+          const d = normalizeDomain(raw);
+          if (!d) { rejected.push({ entry: String(raw).slice(0, 60), reason: 'not a valid domain' }); continue; }
+          if (clean.includes(d)) continue;
+          const clash = secretIdCollision(d, clean);
+          if (clash) { rejected.push({ entry: d, reason: `collides with ${clash}` }); continue; }
+          clean.push(d);
+        }
+        await chrome.storage.local.set({ domains: clean });
+        watchedDomainsCache = clean;
       }
       if (state.settings && typeof state.settings === 'object') {
         await chrome.storage.local.set({ settings: state.settings });
@@ -241,7 +388,7 @@ async function handleMessage(msg) {
       await ensurePeriodicAlarm(true);
       await ensureActiveTabAlarm();
       registerWebRequestForWatched().catch(() => {});
-      return { ok: true, domains: await getDomains() };
+      return { ok: true, domains: await getDomains(), rejected };
     }
 
     case 'getDomainExpiry': {
@@ -252,7 +399,7 @@ async function handleMessage(msg) {
         earliestExpiryMs: earliest,
         nowMs: Date.now(),
         warningThresholdMs: EXPIRY_WARNING_MS,
-        bearerTokenCount: Object.keys(tokens).length,
+        authTokenCount: countAuthTokens(tokens),
       };
     }
 
@@ -331,7 +478,12 @@ async function registerWebRequestForWatched() {
     try { if (await chrome.permissions.contains({ origins })) urls.push(...origins); } catch {}
   }
   if (!urls.length) return;
-  webRequestListener = (details) => { captureFromRequest(details).catch(() => {}); };
+  // Capture failures used to be swallowed silently, so a domain could quietly
+  // stop yielding auth headers with nothing anywhere to say so.
+  webRequestListener = (details) => {
+    captureFromRequest(details).catch(err =>
+      console.warn('[CookieShare:bg] auth capture failed:', err?.message || err));
+  };
   chrome.webRequest.onBeforeSendHeaders.addListener(
     webRequestListener, { urls }, ['requestHeaders', 'extraHeaders']
   );
@@ -345,7 +497,11 @@ if (chrome.permissions?.onAdded) chrome.permissions.onAdded.addListener(() => {
   completePendingAdd().catch(() => {}).finally(() => registerWebRequestForWatched().catch(() => {}));
 });
 if (chrome.permissions?.onRemoved) chrome.permissions.onRemoved.addListener(() => registerWebRequestForWatched().catch(() => {}));
-hydrationDone.then(registerWebRequestForWatched).catch(() => {});
+// Arm capture as early as possible rather than waiting on hydration —
+// registerWebRequestForWatched reads storage itself, and every request that
+// arrives before the listener is attached is auth we never see.
+registerWebRequestForWatched().catch(err =>
+  console.warn('[CookieShare:bg] initial capture arming failed:', err?.message || err));
 
 // When the user grants host permission from the popup, the popup is torn down by
 // the dialog before it can add the domain. Finish the job here.
@@ -432,7 +588,7 @@ chrome.cookies.onChanged.addListener(async (changeInfo) => {
   const domain = changeInfo.cookie.domain.replace(/^\./, '');
   const matched = matchDomain(domain, watchedDomainsCache);
   if (!matched) return;
-  await chrome.alarms.create(`sync-${matched}`, { delayInMinutes: DEBOUNCE_MS / 60_000 });
+  await chrome.alarms.create(`sync-cookie-${matched}`, { delayInMinutes: DEBOUNCE_MS / 60_000 });
 });
 
 // ============================================================
@@ -445,12 +601,25 @@ chrome.alarms.onAlarm.addListener((alarm) => {
   runAlarm(alarm).catch(err => console.warn(`[CookieShare:bg] Alarm ${alarm.name} failed:`, err.message));
 });
 
+// The cookie debounce (60s) and the post-navigation refresh (5s) used to share
+// one "sync-<domain>" alarm, so whichever fired create() last replaced the
+// other's schedule — a cookie change could push out an imminent nav refresh.
+// They get separate names now; the bare "sync-" prefix is still recognised so
+// an alarm scheduled by a previous version is not orphaned.
+const SYNC_ALARM_PREFIXES = ['sync-cookie-', 'sync-nav-', 'sync-'];
+function syncAlarmNames(domain) {
+  return SYNC_ALARM_PREFIXES.map(p => p + domain);
+}
+function domainFromSyncAlarm(name) {
+  for (const p of SYNC_ALARM_PREFIXES) if (name.startsWith(p)) return name.slice(p.length);
+  return null;
+}
+
 async function runAlarm(alarm) {
   if (alarm.name === PERIODIC_ALARM) return syncAll();
   if (alarm.name === ACTIVE_TAB_ALARM) return refreshActiveWatchedDomains();
-  if (alarm.name.startsWith('sync-')) {
-    return syncDomain(alarm.name.slice(5)); // background context → non-interactive auth
-  }
+  const domain = domainFromSyncAlarm(alarm.name);
+  if (domain) return syncDomain(domain); // background context → non-interactive auth
 }
 
 // ============================================================
@@ -468,7 +637,7 @@ chrome.tabs.onUpdated.addListener(async (tabId, info, tab) => {
   try { hostname = new URL(tab.url).hostname; } catch { return; }
   const matched = matchDomain(hostname, watchedDomainsCache);
   if (!matched) return;
-  await chrome.alarms.create(`sync-${matched}`, { delayInMinutes: NAV_REFRESH_DELAY_MS / 60_000 });
+  await chrome.alarms.create(`sync-nav-${matched}`, { delayInMinutes: NAV_REFRESH_DELAY_MS / 60_000 });
   updateBadgeForActiveTab();
 });
 
@@ -537,9 +706,15 @@ async function syncAll(opts = {}) {
   await hydrationDone;
   const domains = await getDomains();
   const results = await Promise.allSettled(domains.map(d => syncDomain(d, opts)));
+  const errors = [];
   results.forEach((r, i) => {
-    if (r.status === 'rejected') console.error(`[CookieShare:bg] Sync failed for ${domains[i]}:`, r.reason);
+    if (r.status === 'rejected') {
+      const message = r.reason?.message || String(r.reason);
+      console.error(`[CookieShare:bg] Sync failed for ${domains[i]}:`, r.reason);
+      errors.push({ domain: domains[i], error: message });
+    }
   });
+  return { total: domains.length, failed: errors.length, ok: domains.length - errors.length, errors };
 }
 
 // Per-domain in-flight lock: overlapping triggers for one domain coalesce into
@@ -570,15 +745,37 @@ async function doSyncDomain(domain, { interactive = false } = {}) {
     return false;
   }
   try {
-    // Collect fresh data, then merge over last-known-good so we never push a
-    // field emptier than what we already have.
+    // Collect fresh data, then merge over last-known-good so a read we could
+    // not perform never pushes a field emptier than what we already have.
+    const { cookies, readable: cookiesReadable } = await getCookiesForDomain(domain);
+    const storage = await getStorageForDomain(domain);
     const fresh = {
-      cookies: await getCookiesForDomain(domain),
-      ...(await getStorageForDomain(domain)),          // localStorage, sessionStorage, indexedDB
+      cookies,
+      localStorage: storage.localStorage,
+      sessionStorage: storage.sessionStorage,
+      indexedDB: storage.indexedDB,
       bearerTokens: await getBearerTokensForDomain(domain),
     };
     const lkg = await getLkg(domain);
-    const merged = mergeSnapshot(fresh, lkg);
+
+    // Logout detection: we could read cookies, we used to have some, and now
+    // there are none. Keyed on the transition, not on emptiness — a site that
+    // never sets cookies (localStorage-only session) must not look logged out.
+    // Without this the LKG guard, which exists so a closed tab can't wipe a
+    // captured session, also made logging out invisible: the old authenticated
+    // session stayed synced to the cloud indefinitely.
+    const loggedOut = cookiesReadable
+      && fresh.cookies.length === 0
+      && Array.isArray(lkg.cookies) && lkg.cookies.length > 0;
+
+    let merged;
+    if (loggedOut) {
+      console.log(`[CookieShare:bg] ${domain} looks logged out — clearing the captured session`);
+      await purgeCapturedAuthForDomain(domain);
+      merged = { cookies: [], localStorage: {}, sessionStorage: {}, indexedDB: {}, bearerTokens: {} };
+    } else {
+      merged = mergeSnapshot(fresh, lkg, { cookies: cookiesReadable, storage: storage.readable });
+    }
     await setLkg(domain, merged);
 
     const earliestExpMs = (() => {
@@ -603,22 +800,32 @@ async function doSyncDomain(domain, { interactive = false } = {}) {
       auth_expires_at: earliestExpMs ? new Date(earliestExpMs).toISOString() : null,
     };
 
-    const pushed = await pushToSecretManager(domain, payload, { interactive });
+    const result = await pushToSecretManager(domain, payload, { interactive });
 
-    await updateStatus(domain, {
+    const status = {
       lastSync: payload.timestamp,
-      lastSuccess: pushed ? payload.timestamp : undefined,
       cookieCount: merged.cookies.length,
       localStorageKeys: countOriginKeys(merged.localStorage),
       sessionStorageKeys: countOriginKeys(merged.sessionStorage),
       indexedDBKeys: countIdbKeys(merged.indexedDB),
-      bearerTokenCount: Object.keys(merged.bearerTokens).length,
+      // Hosts we hold an Authorization header for, kept separate from hosts
+      // where only extra x-* headers were captured. The old single
+      // "bearerTokenCount" counted both and labelled them all bearer tokens.
+      authTokenCount: countAuthTokens(merged.bearerTokens),
+      authHeaderOnlyCount: countHeaderOnlyHosts(merged.bearerTokens),
       authExpiresAt: payload.auth_expires_at,
-      skipped: !pushed,
+      skipped: !result.pushed,
+      trimmed: !!result.trimmed,
+      secretId: secretIdForDomain(domain),
       error: null,
-    });
+    };
+    // Set lastSuccess only on a real upload. updateStatus merges with a spread,
+    // so passing `undefined` OVERWRITES the previous value — which is exactly
+    // how the last-upload time got wiped on every skipped sync.
+    if (result.pushed) status.lastSuccess = payload.timestamp;
+    await updateStatus(domain, status);
     updateBadgeForActiveTab();
-    console.log(`[CookieShare:bg] Synced ${domain}: ${merged.cookies.length} cookies${pushed ? '' : ' (unchanged, skipped push)'}`);
+    console.log(`[CookieShare:bg] Synced ${domain}: ${merged.cookies.length} cookies${result.pushed ? '' : ' (unchanged, skipped push)'}`);
     return true;
   } catch (err) {
     console.error(`[CookieShare:bg] Sync error for ${domain}:`, err);
@@ -655,19 +862,27 @@ async function setLkg(domain, snapshot) {
 // Merge fresh over lkg: a field is only replaced when the fresh read carries
 // data. A tab-less / cold-start read (which yields empties) therefore preserves
 // the previously-captured session rather than wiping it.
-function mergeSnapshot(fresh, lkg = {}) {
+// `readable` says which fresh reads actually happened. A field we genuinely
+// read wins even when it came back empty (that is real data — the user cleared
+// or logged out); a field we could not read falls back to LKG. Omitting
+// `readable` keeps the original conservative behavior: empty never overwrites.
+function mergeSnapshot(fresh, lkg = {}, readable = {}) {
+  const freshCookies = fresh.cookies || [];
   return {
-    cookies: (fresh.cookies && fresh.cookies.length) ? fresh.cookies : (lkg.cookies || []),
-    localStorage: mergeByOrigin(fresh.localStorage, lkg.localStorage),
-    sessionStorage: mergeByOrigin(fresh.sessionStorage, lkg.sessionStorage),
-    indexedDB: mergeByOrigin(fresh.indexedDB, lkg.indexedDB),
+    cookies: (freshCookies.length || readable.cookies) ? freshCookies : (lkg.cookies || []),
+    localStorage: mergeByOrigin(fresh.localStorage, lkg.localStorage, readable.storage),
+    sessionStorage: mergeByOrigin(fresh.sessionStorage, lkg.sessionStorage, readable.storage),
+    indexedDB: mergeByOrigin(fresh.indexedDB, lkg.indexedDB, readable.storage),
     bearerTokens: mergeBearer(fresh.bearerTokens, lkg.bearerTokens),
   };
 }
-function mergeByOrigin(fresh = {}, lkg = {}) {
+// Only origins the fresh read actually visited can be cleared. An LKG origin
+// the read never saw (no tab for it) is always carried forward.
+function mergeByOrigin(fresh = {}, lkg = {}, readable = false) {
   const out = { ...lkg };
   for (const [origin, val] of Object.entries(fresh)) {
-    if (val && Object.keys(val).length) out[origin] = val; // fresh wins only when non-empty
+    if (val && Object.keys(val).length) out[origin] = val; // fresh wins when non-empty
+    else if (readable) out[origin] = val || {};            // read it, genuinely empty → clear
   }
   return out;
 }
@@ -687,19 +902,56 @@ async function getBearerTokensForDomain(domain) {
   await hydrationDone;
   const result = {};
   for (const [host, data] of Object.entries(capturedBearerTokens)) {
-    if (host === domain || host.endsWith('.' + domain)) result[host] = data;
+    if (host !== domain && !host.endsWith('.' + domain)) continue;
+    // A host that matches a MORE specific watched domain belongs to that one.
+    // Plain suffix matching put a token captured on app.example.com into both
+    // the app.example.com secret and the example.com secret whenever both were
+    // watched, leaking the child's credentials into the parent's.
+    if (matchDomain(host, watchedDomainsCache) !== domain) continue;
+    result[host] = data;
   }
   return result;
+}
+
+// Drop every captured auth entry belonging to a domain. Used on removal and on
+// logout; without it captured headers lived forever, and the LKG merge then
+// kept re-publishing a token the site had already invalidated.
+async function purgeCapturedAuthForDomain(domain) {
+  let purged = false;
+  for (const host of Object.keys(capturedBearerTokens)) {
+    if (host === domain || host.endsWith('.' + domain)) {
+      delete capturedBearerTokens[host];
+      purged = true;
+    }
+  }
+  if (purged) await persistCapturedTokens();
+  return purged;
+}
+
+// An entry can hold a real Authorization value, or only extra x-* headers.
+// Reporting both as "bearer tokens" overstated what was captured.
+function countAuthTokens(byHost) {
+  return Object.values(byHost || {}).filter(e => e && (e.token || e.raw)).length;
+}
+function countHeaderOnlyHosts(byHost) {
+  return Object.values(byHost || {}).filter(
+    e => e && !e.token && !e.raw && e.extraHeaders && Object.keys(e.extraHeaders).length
+  ).length;
 }
 
 // ============================================================
 // Cookie collection
 // ============================================================
 
+// Returns { cookies, readable }. `readable` distinguishes "we looked and there
+// are none" (an authoritative empty — the user logged out) from "the read
+// failed" (permission revoked / API error). Without that distinction an empty
+// result was always treated as unreadable, so a logout could never propagate.
 async function getCookiesForDomain(domain) {
   const urls = [`https://${domain}`, `http://${domain}`, `https://www.${domain}`];
   const allCookies = [];
   const seen = new Set();
+  let readable = false;
   const push = (cookies) => {
     for (const c of cookies) {
       const key = `${c.domain}|${c.name}|${c.path}`;
@@ -707,11 +959,12 @@ async function getCookiesForDomain(domain) {
     }
   };
   // getAll({domain}) also catches host-only cookies on subdomains.
-  push(await chrome.cookies.getAll({ domain }).catch(() => []));
+  try { push(await chrome.cookies.getAll({ domain })); readable = true; }
+  catch (e) { console.warn(`[CookieShare:bg] cookie read failed for ${domain}:`, e.message); }
   for (const url of urls) {
-    try { push(await chrome.cookies.getAll({ url })); } catch { /* ignore */ }
+    try { push(await chrome.cookies.getAll({ url })); readable = true; } catch { /* ignore */ }
   }
-  return allCookies;
+  return { cookies: allCookies, readable };
 }
 
 // ============================================================
@@ -731,9 +984,10 @@ async function getStorageForDomain(domain) {
   });
 
   if (matchingTabs.length === 0) {
-    // No tab open → we couldn't read storage. Return empties; the LKG merge
-    // will preserve whatever we captured last time.
-    return { localStorage: {}, sessionStorage: {}, indexedDB: {} };
+    // No tab open → we couldn't read storage. `readable: false` tells the merge
+    // to preserve whatever we captured last time rather than treat these
+    // empties as an authoritative "the site has no storage".
+    return { localStorage: {}, sessionStorage: {}, indexedDB: {}, readable: false };
   }
 
   const localStorageByOrigin = {};
@@ -759,7 +1013,12 @@ async function getStorageForDomain(domain) {
       console.warn(`[CookieShare:bg] Could not inject into tab ${tab.id} for ${domain}:`, err.message);
     }
   }
-  return { localStorage: localStorageByOrigin, sessionStorage: sessionStorageByOrigin, indexedDB: indexedDBByOrigin };
+  return {
+    localStorage: localStorageByOrigin,
+    sessionStorage: sessionStorageByOrigin,
+    indexedDB: indexedDBByOrigin,
+    readable: true,
+  };
 }
 
 // Injected into the page. Auth-related keys are captured regardless of size;
@@ -875,27 +1134,38 @@ async function pushToSecretManager(domain, payload, { interactive = false } = {}
   const settings = await getSettings();
   const project = settings.gcpProjectId;
   if (!project) throw new Error('GCP project not configured — set it in Options.');
-  const secretId = 'cookie-share-' + domain.replace(/\./g, '-');
+  const secretId = secretIdForDomain(domain);
   const base = `https://secretmanager.googleapis.com/v1/projects/${project}`;
 
-  // Skip the push (and the billable version) when the session content is
-  // unchanged. Hash the content only — not the per-sync timestamp — so an
-  // otherwise-identical sync doesn't create a redundant version.
+  // Encode (gzip when large) BEFORE hashing. Trimming happens here, so the
+  // skip-check must hash what the cloud actually receives — hashing the
+  // untrimmed payload let a trimmed push masquerade as a complete one, and
+  // reported full counts for truncated cloud data.
   const { timestamp, auth_expires_at, ...content } = payload;
-  const hash = await sha256Hex(JSON.stringify(content));
-  const hashKey = `pushHash_${domain}`;
-  const { [hashKey]: prevHash } = await chrome.storage.local.get(hashKey);
-  if (prevHash === hash) return false;
-
-  // Encode (gzip when large). Verify decoded size and trim if still over cap.
+  let effective = content;
+  let trimmed = false;
   let secretData = await encodePayload(payload);
   if (decodedBytes(secretData) > SECRET_MAX_BYTES) {
     console.warn(`[CookieShare:bg] Payload over cap for ${domain}, trimming large values`);
-    secretData = await encodePayload(trimLargeValues(payload));
+    const trimmedPayload = trimLargeValues(payload);
+    secretData = await encodePayload(trimmedPayload);
     if (decodedBytes(secretData) > SECRET_MAX_BYTES) {
       throw new Error(`Payload still too large after trimming (${decodedBytes(secretData)} > ${SECRET_MAX_BYTES}).`);
     }
+    const { timestamp: _ts, auth_expires_at: _exp, ...trimmedContent } = trimmedPayload;
+    effective = trimmedContent;
+    trimmed = true;
   }
+
+  // Skip the push (and the billable version) only when the destination AND the
+  // content are both unchanged. The destination is part of the hash: without
+  // it, switching GCP project (or deleting the secret in the console) left
+  // every later sync skipping before ensureSecret ever ran — reporting healthy
+  // syncs to a secret that did not exist.
+  const hash = await sha256Hex(JSON.stringify({ project, secretId, content: effective }));
+  const hashKey = `pushHash_${domain}`;
+  const { [hashKey]: prevHash } = await chrome.storage.local.get(hashKey);
+  if (prevHash === hash) return { pushed: false, trimmed, unchanged: true };
 
   await ensureSecret(base, secretId, { interactive });
 
@@ -910,9 +1180,9 @@ async function pushToSecretManager(domain, payload, { interactive = false } = {}
   }
 
   await chrome.storage.local.set({ [hashKey]: hash });
-  console.log(`[CookieShare:bg] Pushed to ${secretId}`);
+  console.log(`[CookieShare:bg] Pushed to ${secretId}${trimmed ? ' (trimmed)' : ''}`);
   await destroyOldVersions(base, secretId, VERSIONS_TO_KEEP, { interactive });
-  return true;
+  return { pushed: true, trimmed, bytes: decodedBytes(secretData) };
 }
 
 async function encodePayload(payload) {
@@ -998,23 +1268,52 @@ async function ensureSecret(base, secretId, { interactive = false } = {}) {
   throw new Error(`Check secret failed (${check.status}): ${await check.text()}`);
 }
 
+// Enforce the "keep only N versions" promise. The previous implementation
+// failed three ways at once: it filtered to state:ENABLED, so DISABLED versions
+// (which still hold the credential) were never destroyed; it read a single
+// 100-item page; and it never checked the destroy response, logging attempted
+// destruction as completed. Returns counts so callers can tell.
 async function destroyOldVersions(base, secretId, keep, { interactive = false } = {}) {
-  const listResp = await gsmFetch(`${base}/secrets/${secretId}/versions?filter=state:ENABLED&pageSize=100`, {}, { interactive });
-  if (!listResp.ok) {
-    console.warn(`[CookieShare:bg] list versions failed for ${secretId}: ${listResp.status}`);
-    return;
+  const versions = [];
+  let pageToken = '';
+  // Bounded so a pathological secret can't spin forever.
+  for (let page = 0; page < 20; page++) {
+    const url = `${base}/secrets/${secretId}/versions?pageSize=100${pageToken ? `&pageToken=${encodeURIComponent(pageToken)}` : ''}`;
+    const listResp = await gsmFetch(url, {}, { interactive });
+    if (!listResp.ok) {
+      console.warn(`[CookieShare:bg] list versions failed for ${secretId}: ${listResp.status}`);
+      return { destroyed: 0, failed: 0, listed: versions.length, incomplete: true };
+    }
+    const data = await listResp.json();
+    versions.push(...(data.versions || []));
+    pageToken = data.nextPageToken || '';
+    if (!pageToken) break;
   }
-  const data = await listResp.json();
-  const versions = (data.versions || []).sort((a, b) => new Date(b.createTime) - new Date(a.createTime));
-  const toDestroy = versions.slice(keep);
+
+  // DESTROYED versions are already gone. Keep the newest N ENABLED ones; every
+  // other live version — enabled surplus or disabled — still stores the
+  // credential and must go.
+  const live = versions.filter(v => v.state === 'ENABLED' || v.state === 'DISABLED');
+  const byNewest = (a, b) => new Date(b.createTime) - new Date(a.createTime);
+  const enabled = live.filter(v => v.state === 'ENABLED').sort(byNewest);
+  const keepSet = new Set(enabled.slice(0, keep).map(v => v.name));
+  const toDestroy = live.filter(v => !keepSet.has(v.name)).sort(byNewest);
+
+  let destroyed = 0, failed = 0;
   for (const v of toDestroy) {
     try {
-      await gsmFetch(`https://secretmanager.googleapis.com/v1/${v.name}:destroy`, { method: 'POST' }, { interactive });
+      const resp = await gsmFetch(`https://secretmanager.googleapis.com/v1/${v.name}:destroy`, { method: 'POST' }, { interactive });
+      if (resp.ok) destroyed++;
+      else { failed++; console.warn(`[CookieShare:bg] destroy ${v.name} failed: ${resp.status}`); }
     } catch (e) {
+      failed++;
       console.warn(`[CookieShare:bg] destroy ${v.name} failed:`, e.message);
     }
   }
-  if (toDestroy.length) console.log(`[CookieShare:bg] Destroyed ${toDestroy.length} old versions of ${secretId} (kept ${keep})`);
+  if (destroyed || failed) {
+    console.log(`[CookieShare:bg] ${secretId}: destroyed ${destroyed}, failed ${failed}, kept ${keepSet.size}`);
+  }
+  return { destroyed, failed, listed: versions.length, incomplete: false };
 }
 
 // ============================================================
@@ -1108,5 +1407,5 @@ chrome.runtime.onStartup.addListener(() => {
 
 // Exposed for the Node test harness (no-op in the extension environment).
 if (typeof module !== 'undefined' && module.exports) {
-  module.exports = { matchDomain, mergeSnapshot, mergeByOrigin, mergeBearer, trimLargeValues, base64FromBytes, base64FromString, countOriginKeys, countIdbKeys, parseJwtExpMs, encodePayload, sha256Hex, getToken, invalidateToken, gsmFetch, handleMessage, syncDomain, completePendingAdd };
+  module.exports = { matchDomain, mergeSnapshot, mergeByOrigin, mergeBearer, trimLargeValues, base64FromBytes, base64FromString, countOriginKeys, countIdbKeys, parseJwtExpMs, encodePayload, sha256Hex, getToken, invalidateToken, gsmFetch, handleMessage, syncDomain, completePendingAdd, normalizeDomain, isValidDomain, secretIdForDomain, secretIdCollision, countAuthTokens, countHeaderOnlyHosts, syncAlarmNames, domainFromSyncAlarm, destroyOldVersions, getBearerTokensForDomain, purgeCapturedAuthForDomain, registrableDomain, originsForDomain, syncAll };
 }

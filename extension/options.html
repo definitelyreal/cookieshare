@@ -8,66 +8,83 @@
 <body>
   <div id="app">
     <header>
-      <h1>Cookie Share</h1>
-      <p class="subtitle">Sync browser sessions to Google Secret Manager</p>
+      <img src="icons/icon48.png" alt="" class="brand-icon" width="28" height="28">
+      <div>
+        <h1>Cookie Share</h1>
+        <p class="subtitle">Sync browser sessions to Google Secret Manager</p>
+      </div>
     </header>
 
-    <!-- Auth warning banner -->
-    <div id="auth-banner" class="banner hidden">
-      <span>Not signed in to Google</span>
-      <button id="btn-auth" class="btn btn-small">Sign In</button>
+    <!-- Setup checklist. Shown until the basics are done; first run used to be
+         a bare empty table with no mention of signing in or setting a project. -->
+    <section id="setup-section" class="card hidden">
+      <h2>Finish setup</h2>
+      <ol class="checklist">
+        <li id="step-auth"><span class="check">○</span> Sign in to Google
+          <button id="btn-auth" class="btn btn-small">Sign in</button></li>
+        <li id="step-project"><span class="check">○</span> Set your GCP project ID (below)</li>
+        <li id="step-domain"><span class="check">○</span> Add a site, or click the extension on any page</li>
+      </ol>
+    </section>
+
+    <div id="auth-banner" class="banner hidden" role="alert">
+      <span id="auth-banner-text">Not signed in to Google</span>
+      <button id="btn-auth-2" class="btn btn-small">Sign in</button>
     </div>
 
-    <!-- Watched Domains -->
-    <section>
+    <section class="card">
       <div class="section-header">
         <h2>Watched Domains</h2>
         <button id="btn-sync-all" class="btn btn-small">Sync All</button>
       </div>
 
-      <table>
-        <thead>
-          <tr>
-            <th>Domain</th>
-            <th>Cookies</th>
-            <th>Storage</th>
-            <th>Last Sync</th>
-            <th>Status</th>
-            <th></th>
-          </tr>
-        </thead>
-        <tbody id="domains-body"></tbody>
-      </table>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>Domain</th>
+              <th>Cookies</th>
+              <th>Storage</th>
+              <th>Auth</th>
+              <th>Last upload</th>
+              <th>Status</th>
+              <th><span class="sr-only">Actions</span></th>
+            </tr>
+          </thead>
+          <tbody id="domains-body"></tbody>
+        </table>
+      </div>
 
       <div id="empty-state" class="empty hidden">
-        No domains watched yet. Add one below or use the popup on any site.
+        No domains watched yet. Add one below, or open the extension popup on any site.
       </div>
 
       <div class="input-row" style="margin-top: 12px">
-        <input type="text" id="input-domain" placeholder="example.com">
+        <label for="input-domain" class="sr-only">Domain to watch</label>
+        <input type="text" id="input-domain" placeholder="example.com" autocomplete="off" spellcheck="false">
         <button id="btn-add" class="btn btn-primary">Add</button>
       </div>
+      <p id="add-error" class="inline-error hidden" role="alert"></p>
     </section>
 
-    <!-- Settings -->
-    <section>
+    <section class="card">
       <h2>Settings</h2>
       <div class="setting-row">
-        <label>GCP Project ID</label>
-        <input type="text" id="input-project" placeholder="my-project-123">
+        <label for="input-project">GCP Project ID</label>
+        <input type="text" id="input-project" placeholder="my-project-123" autocomplete="off" spellcheck="false">
       </div>
       <div class="setting-row">
-        <label>Sync interval (minutes)</label>
+        <label for="input-interval">Sync interval (minutes)</label>
         <input type="number" id="input-interval" min="1" max="1440" value="15">
       </div>
       <div class="setting-row">
-        <label>Capture from incognito tabs</label>
+        <label for="input-capture-incognito">Capture from incognito tabs</label>
         <input type="checkbox" id="input-capture-incognito">
       </div>
       <button id="btn-save-settings" class="btn btn-secondary" style="margin-top: 8px">Save Settings</button>
 
       <div class="setting-row" style="margin-top: 16px">
-        <label>Backup / restore setup</label>
+        <label for="btn-export">Backup / restore setup</label>
         <span>
           <button id="btn-export" class="btn btn-small">Export</button>
           <button id="btn-import" class="btn btn-small">Import</button>
@@ -75,6 +92,8 @@
         </span>
       </div>
     </section>
+
+    <p id="status-line" class="status-line hidden" role="status" aria-live="polite"></p>
   </div>
   <script src="options.js"></script>
 </body>

@@ -4,6 +4,6 @@
   "private": true,
   "description": "Chrome extension that syncs browser sessions to Google Secret Manager for authorized domains",
   "scripts": {
-    "test": "node test/logic.test.js && node test/encoding.test.js && node test/auth.test.js && node test/handlers.test.js"
+    "test": "node test/logic.test.js && node test/encoding.test.js && node test/auth.test.js && node test/handlers.test.js && node test/regressions.test.js"
   }
 }

@@ -7,30 +7,41 @@
 <body>
   <div id="app">
     <header>
-      <h1>Cookie Share</h1>
+      <img src="icons/icon32.png" alt="" class="brand-icon" width="16" height="16">
+      <span class="brand-name">Cookie Share</span>
     </header>
+
+    <!-- Not signed in to Google. Previously only the options page said this. -->
+    <div id="auth-banner" class="banner banner-warn hidden">
+      <span>Not signed in to Google</span>
+      <button id="btn-signin" class="btn btn-warning">Sign in</button>
+    </div>
 
     <!-- State: current site not watched yet -->
     <div id="add-section" class="section hidden">
       <div class="site-name" id="current-domain"></div>
-      <button id="btn-sync-site" class="btn btn-primary">Sync This Site</button>
+      <button id="btn-sync-site" class="btn btn-primary btn-block">Sync This Site</button>
+      <p class="hint">Copies this site's session to Google Secret Manager so scripts can reuse it.</p>
     </div>
 
     <!-- State: current site is watched -->
     <div id="status-section" class="section hidden">
-      <div class="site-name" id="watched-domain"></div>
+      <div class="site-head">
+        <span class="site-name" id="watched-domain"></span>
+        <span class="status-pill" id="status-pill"><span class="dot"></span><span id="status-pill-text">—</span></span>
+      </div>
 
-      <div id="expiry-banner" class="expiry-banner hidden">
-        <div class="expiry-text">
-          <span class="expiry-title">Auth expiring</span>
-          <span class="expiry-detail" id="expiry-detail"></span>
+      <div id="expiry-banner" class="banner banner-warn hidden">
+        <div class="banner-text">
+          <span class="banner-title">Auth expiring</span>
+          <span class="banner-detail" id="expiry-detail"></span>
         </div>
-        <button id="btn-refresh-now" class="btn btn-warning">Refresh now</button>
+        <button id="btn-refresh-now" class="btn btn-warning">Refresh</button>
       </div>
 
       <div class="status-row">
-        <span class="label">Last sync</span>
-        <span class="value" id="last-sync">—</span>
+        <span class="label">Last upload</span>
+        <span class="value" id="last-upload">—</span>
       </div>
       <div class="status-row">
         <span class="label">Cookies</span>
@@ -41,23 +52,49 @@
         <span class="value" id="storage-count">—</span>
       </div>
       <div class="status-row">
-        <span class="label">Bearer tokens</span>
-        <span class="value" id="bearer-count">—</span>
+        <span class="label" id="auth-label">Auth tokens</span>
+        <span class="value" id="auth-count">—</span>
       </div>
-      <div id="error-row" class="status-row" style="display:none">
-        <span class="label">Error</span>
-        <span class="value error" id="sync-error"></span>
+
+      <div id="trimmed-note" class="note hidden">
+        Payload exceeded the 64&nbsp;KB limit, so large values were truncated before upload.
       </div>
+
+      <div id="error-box" class="error-box hidden">
+        <div class="error-head">
+          <span class="error-title">Last sync failed</span>
+          <button id="btn-copy-error" class="btn-link" type="button">Copy</button>
+        </div>
+        <p class="error-text" id="sync-error"></p>
+      </div>
+
+      <!-- The payoff: the whole point is consuming this elsewhere. -->
+      <div class="secret-box">
+        <div class="secret-head">
+          <span class="secret-label">Read it back</span>
+          <button id="btn-copy-pull" class="btn-link" type="button">Copy command</button>
+        </div>
+        <code class="secret-id" id="secret-id">—</code>
+      </div>
+
       <div class="btn-row">
         <button id="btn-sync-now" class="btn btn-secondary">Sync Now</button>
-        <button id="btn-remove" class="btn btn-danger">Remove</button>
+        <button id="btn-stop" class="btn btn-danger">Stop syncing</button>
       </div>
+      <p id="stop-explain" class="hint hidden">
+        Stops syncing and clears local data. <strong>The secret already stored in Google is
+        kept</strong> — delete it separately below.
+      </p>
+      <button id="btn-delete-secret" class="btn btn-danger btn-block hidden">Delete cloud secret</button>
     </div>
 
     <!-- State: no usable site (chrome://, new tab, etc.) -->
     <div id="no-site-section" class="section hidden">
-      <p class="muted">Navigate to a site to sync its session.</p>
+      <p class="muted">Open a website to sync its session.</p>
     </div>
+
+    <!-- Persistent: cleared by the next successful action, never on a timer. -->
+    <p id="status-line" class="status-line hidden" role="status" aria-live="polite"></p>
 
     <footer>
       <span class="footer-stats"><span id="domain-count">0</span> sites watched</span>
