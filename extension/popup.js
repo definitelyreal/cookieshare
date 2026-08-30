@@ -45,6 +45,12 @@ document.addEventListener('DOMContentLoaded', async () => {
   }
 
   checkAuth();
+  // A refusal from the background's add path (e.g. a secret-name collision)
+  // happens after the popup was torn down by the permission dialog, so it is
+  // reported here on next open. Nothing surfaced it before.
+  sendMessage({ type: 'takeLastAddError' })
+    .then(r => { if (r?.error) setStatus(r.error, 'error'); })
+    .catch(() => {});
 
   $('#btn-sync-site').addEventListener('click', handleAddDomain);
   $('#btn-sync-now').addEventListener('click', handleSyncNow);
@@ -147,14 +153,18 @@ async function checkAuth() {
   // Non-interactive probe: reports a signed-out state without popping a
   // sign-in dialog just because the panel was opened.
   try {
+    // The auth banner is evaluated regardless of project config — an early
+    // return here left the signed-out state invisible for anyone who had not
+    // set a project yet, which is exactly the person most likely to be
+    // signed out.
+    const auth = await sendMessage({ type: 'authStatus' });
+    toggle('#auth-banner', !auth?.signedIn);
+
     const { settings = {} } = await chrome.storage.local.get('settings');
     const local = await fetch(chrome.runtime.getURL('local-config.json')).then(r => r.ok ? r.json() : {}).catch(() => ({}));
     if (!settings.gcpProjectId && !local.gcpProjectId) {
       setStatus('No GCP project set. Open Options to finish setup.', 'warn');
-      return;
     }
-    const auth = await sendMessage({ type: 'authStatus' });
-    toggle('#auth-banner', !auth?.signedIn);
   } catch { /* non-fatal */ }
 }
 
@@ -187,11 +197,13 @@ async function handleAddDomain() {
 
   try {
     const origins = cachedOrigins || [`*://${currentDomain}/*`, `*://*.${currentDomain}/*`];
-    // Record intent BEFORE the prompt: the Chrome permission dialog closes this
-    // popup, so the background finishes the add via permissions.onAdded if we
-    // don't survive the await. No re-click needed.
-    await chrome.storage.local.set({ pendingAdd: currentDomain });
+    // Record intent BEFORE the prompt (the permission dialog closes this popup,
+    // so the background finishes the add via permissions.onAdded), but do NOT
+    // await it here — an await between the click and permissions.request can
+    // cost the user gesture. The write is started, then awaited afterwards.
+    const pendingWrite = chrome.storage.local.set({ pendingAdd: currentDomain });
     const granted = await chrome.permissions.request({ origins });
+    await pendingWrite.catch(() => {});
     if (!granted) {
       await chrome.storage.local.remove('pendingAdd');
       setStatus('Permission denied — the site was not added.', 'error');

@@ -15,7 +15,8 @@ const store = {
   settings: { gcpProjectId: 'proj-1' },
 };
 
-const spies = { fetches: [], destroyed: [], alarmsCleared: [], alarmsCreated: [] };
+const spies = { fetches: [], destroyed: [], alarmsCleared: [], alarmsCreated: [], permsRemoved: [] };
+let identityShouldFail = false;
 const noop = () => {};
 const listener = { addListener: noop, removeListener: noop };
 
@@ -70,9 +71,20 @@ global.chrome = {
     create: async (n, o) => { spies.alarmsCreated.push({ n, o }); },
     clear: async (n) => { spies.alarmsCleared.push(n); return true; },
   },
-  permissions: { remove: async () => true, contains: async () => true, onAdded: listener, onRemoved: listener },
+  permissions: {
+    remove: async (o) => { spies.permsRemoved.push(o); return true; },
+    contains: async () => true,
+    onAdded: listener,
+    onRemoved: listener,
+  },
   action: { setBadgeText: noop, setBadgeBackgroundColor: noop },
-  identity: { getAuthToken: async () => ({ token: 'T' }), removeCachedAuthToken: async () => {} },
+  identity: {
+    getAuthToken: async () => {
+      if (identityShouldFail) throw new Error('The user is not signed in.');
+      return { token: 'T' };
+    },
+    removeCachedAuthToken: async () => {},
+  },
   scripting: {},
 };
 
@@ -455,6 +467,89 @@ async function test(name, fn) {
     assert.strictEqual(resp.ok, true, 'a zero-domain run is ok:true, not ok:0');
     assert.strictEqual(resp.succeeded, 0);
     assert.strictEqual(typeof resp.ok, 'boolean');
+  });
+
+  // ==========================================================
+  // Findings from the SECOND verification round (on 079c70e)
+  // ==========================================================
+  await test('W1: logging out of a CHILD retires the child\'s own captured auth', async () => {
+    const watched = ['example.com', 'app.example.com'];
+    bg._setWatchedDomainsCache(watched);
+    Object.assign(bg._capturedBearerTokens, {
+      'api.app.example.com': { token: 'CHILD', raw: 'Bearer CHILD' },
+      'api.example.com': { token: 'PARENT', raw: 'Bearer PARENT' },
+    });
+
+    await bg.purgeCapturedAuthForDomain('app.example.com', watched);
+
+    const child = await bg.getBearerTokensForDomain('app.example.com');
+    assert.ok(!('api.app.example.com' in child),
+      'the child\'s own token must be retired — a watched parent is not another owner');
+    const parent = await bg.getBearerTokensForDomain('example.com');
+    assert.ok('api.example.com' in parent, 'the parent keeps its own, untouched');
+  });
+
+  await test('W1b: parent logout still spares a separately-watched child (both directions hold)', async () => {
+    const watched = ['example.com', 'app.example.com'];
+    bg._setWatchedDomainsCache(watched);
+    Object.assign(bg._capturedBearerTokens, {
+      'api.app.example.com': { token: 'CHILD', raw: 'Bearer CHILD' },
+      'api.example.com': { token: 'PARENT', raw: 'Bearer PARENT' },
+    });
+
+    await bg.purgeCapturedAuthForDomain('example.com', watched);
+
+    assert.ok('api.app.example.com' in await bg.getBearerTokensForDomain('app.example.com'),
+      'child survives a parent logout');
+    assert.ok(!('api.example.com' in await bg.getBearerTokensForDomain('example.com')),
+      'parent retires its own');
+  });
+
+  await test('W2: an unknown watch set never discards stored auth', () => {
+    const stored = { 'api.example.com': { token: 'X' }, 'api.app.example.com': { token: 'Y' } };
+    // Hydration swallows its own errors; an empty cache must not be read as
+    // "nothing is watched, so delete everything".
+    assert.deepStrictEqual(bg.ownedBearerTokens(stored, 'example.com', []), stored);
+    assert.deepStrictEqual(bg.ownedBearerTokens(stored, 'example.com', undefined), stored);
+    // With a real list, filtering resumes.
+    const filtered = bg.ownedBearerTokens(stored, 'example.com', ['example.com', 'app.example.com']);
+    assert.ok('api.example.com' in filtered);
+    assert.ok(!('api.app.example.com' in filtered));
+  });
+
+  await test('W3: a refused collision hands back the permission and surfaces the reason', async () => {
+    spies.permsRemoved = [];
+    store.domains = ['a-b.com'];
+    bg._setWatchedDomainsCache(['a-b.com']);
+    store.pendingAdd = 'a.b-com';
+    delete store.lastAddError;
+
+    await bg.completePendingAdd();
+
+    assert.deepStrictEqual((await bg.handleMessage({ type: 'getDomains' })).domains, ['a-b.com'],
+      'still refused');
+    assert.ok(spies.permsRemoved.length > 0, 'the just-granted host permission was handed back');
+    const taken = await bg.handleMessage({ type: 'takeLastAddError' });
+    assert.ok(taken.error && /a-b\.com/.test(taken.error), 'the reason is retrievable by the popup');
+    const again = await bg.handleMessage({ type: 'takeLastAddError' });
+    assert.strictEqual(again.error, null, 'and is cleared once read');
+  });
+
+  await test('W4: private-registry suffixes are refused too', () => {
+    for (const s of ['uk.com', 'blogspot.com', 'cloudfront.net', 'com.de']) {
+      assert.strictEqual(bg.normalizeDomain(s), null, `${s} must not be watchable`);
+    }
+    assert.strictEqual(bg.normalizeDomain('mysite.uk.com'), 'mysite.uk.com', 'a real domain under one still works');
+    assert.ok(!bg.originsForDomain('mysite.uk.com').includes('*://*.uk.com/*'),
+      'and its parent walk stops before the registry');
+  });
+
+  await test('W5: authStatus reads Chrome directly, not the in-memory token cache', async () => {
+    identityShouldFail = true;
+    const out = await bg.handleMessage({ type: 'authStatus' });
+    identityShouldFail = false;
+    assert.strictEqual(out.signedIn, false,
+      'a signed-out browser reports signed-out even though getToken has a cached token');
   });
 
   console.log(`\n${passed} passed, ${failed} failed`);

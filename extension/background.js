@@ -144,9 +144,15 @@ function secretIdCollision(domain, existingDomains) {
 // Host permission scope
 // ============================================================
 
-// Multi-label public suffixes common enough to matter here. Not the full Public
-// Suffix List — the only job is to stop the parent walk before it reaches
-// something nobody should ever hold permission over.
+// Multi-label public suffixes common enough to matter here, including the
+// private registries most likely to show up in a browser session.
+//
+// KNOWN LIMITATION: this is an approximation, not the Public Suffix List. The
+// real PSL is ~230 KB and changes constantly; bundling and refreshing it is not
+// justified for a single-user tool. A suffix that is missing here means the
+// parent walk may add one broader origin to the permission prompt — which
+// Chrome still shows the user for approval — never a silent grant. Anything
+// listed here is also refused as a watch target outright (see isValidDomain).
 const MULTI_LABEL_SUFFIXES = new Set([
   'co.uk', 'org.uk', 'me.uk', 'ac.uk', 'gov.uk', 'net.uk', 'sch.uk',
   'com.au', 'net.au', 'org.au', 'edu.au', 'gov.au', 'id.au',
@@ -161,6 +167,10 @@ const MULTI_LABEL_SUFFIXES = new Set([
   'com.es', 'com.pt', 'com.ua', 'co.il', 'com.my', 'co.id', 'co.th',
   'github.io', 'pages.dev', 'workers.dev', 'vercel.app', 'netlify.app',
   'herokuapp.com', 'firebaseapp.com', 'web.app', 'appspot.com',
+  // Private registries: these sell subdomains, so they are suffixes too.
+  'uk.com', 'eu.com', 'us.com', 'co.com', 'com.de', 'blogspot.com',
+  'cloudfront.net', 'azurewebsites.net', 'cloudapp.net', 's3.amazonaws.com',
+  'translate.goog', 'glitch.me', 'onrender.com', 'fly.dev', 'ngrok.io',
 ]);
 
 // The shortest ancestor of `host` that a person could actually register, e.g.
@@ -309,7 +319,9 @@ async function handleMessage(msg) {
       // Revoke this domain's own host permissions (least privilege). Only the
       // domain's own origins — never parent origins a sibling might still need.
       chrome.permissions.remove({ origins: [`*://*.${msg.domain}/*`, `*://${msg.domain}/*`] }).catch(() => {});
-      await purgeCapturedAuthForDomain(msg.domain);
+      // `domains` is the post-removal list, so the purge folds msg.domain back
+      // into the ownership scope itself.
+      await purgeCapturedAuthForDomain(msg.domain, domains);
       return { domains };
     }
 
@@ -359,13 +371,23 @@ async function handleMessage(msg) {
 
     // Non-interactive probe so the UI can show a signed-out state without
     // triggering a sign-in popup just because someone opened the panel.
+    // Goes straight to chrome.identity rather than through getToken: getToken
+    // answers from its in-memory cache, so it would keep reporting "signed in"
+    // after the user signed out of Chrome.
     case 'authStatus':
       try {
-        await getToken({ interactive: false });
-        return { signedIn: true };
+        const t = await chrome.identity.getAuthToken({ interactive: false });
+        const token = typeof t === 'string' ? t : t?.token;
+        return { signedIn: !!token };
       } catch (err) {
         return { signedIn: false, error: err.message };
       }
+
+    case 'takeLastAddError': {
+      const { lastAddError } = await chrome.storage.local.get('lastAddError');
+      if (lastAddError) await chrome.storage.local.remove('lastAddError');
+      return { error: lastAddError || null };
+    }
 
     case 'settingsUpdated':
       // Recreate the periodic alarm so a changed interval takes effect.
@@ -550,8 +572,12 @@ async function completePendingAdd() {
   });
   if (refused) {
     console.warn(`[CookieShare:bg] Refused ${pendingAdd}: shares secret id with ${refused}`);
+    // Hand back the permission the user just granted — keeping host access for
+    // a domain we refused to watch is access we have no use for.
+    chrome.permissions.remove({ origins }).catch(() => {});
+    // Surfaced by the popup on next open; nothing read this before.
     await chrome.storage.local.set({
-      lastAddError: `"${pendingAdd}" and "${refused}" both map to ${secretIdForDomain(pendingAdd)}. Remove one first.`,
+      lastAddError: `"${pendingAdd}" and "${refused}" both map to the secret ${secretIdForDomain(pendingAdd)}. Remove one first.`,
     });
     return;
   }
@@ -778,8 +804,10 @@ async function doSyncDomain(domain, { interactive = false } = {}) {
   console.log(`[CookieShare:bg] Syncing ${domain} (interactive=${interactive})...`);
   await hydrationDone;
   // Bail if the domain was removed after this sync was scheduled (e.g. a
-  // debounce alarm that fired after "Remove").
-  if (!(await getDomains()).includes(domain)) {
+  // debounce alarm that fired after "Remove"). This read is also the
+  // authoritative watch list used for auth ownership below.
+  const watched = await getDomains();
+  if (!watched.includes(domain)) {
     console.log(`[CookieShare:bg] ${domain} no longer watched, skipping sync`);
     return false;
   }
@@ -797,7 +825,7 @@ async function doSyncDomain(domain, { interactive = false } = {}) {
     };
     const storedLkg = await getLkg(domain);
     // Retire any cross-domain auth an earlier version stored here.
-    const lkg = { ...storedLkg, bearerTokens: ownedBearerTokens(storedLkg.bearerTokens, domain) };
+    const lkg = { ...storedLkg, bearerTokens: ownedBearerTokens(storedLkg.bearerTokens, domain, watched) };
 
     // Logout detection: we could read cookies, we used to have some, and now
     // there are none. Keyed on the transition, not on emptiness — a site that
@@ -812,7 +840,7 @@ async function doSyncDomain(domain, { interactive = false } = {}) {
     let merged;
     if (loggedOut) {
       console.log(`[CookieShare:bg] ${domain} looks logged out — clearing the captured session`);
-      await purgeCapturedAuthForDomain(domain);
+      await purgeCapturedAuthForDomain(domain, watched);
       merged = { cookies: [], localStorage: {}, sessionStorage: {}, indexedDB: {}, bearerTokens: {} };
     } else {
       merged = mergeSnapshot(fresh, lkg, { cookies: cookiesReadable, storage: storage.readable });
@@ -960,12 +988,20 @@ async function getBearerTokensForDomain(domain) {
 // Hosts under `domain` that a MORE specific watched domain owns are left
 // alone: logging out of example.com must not destroy the captured auth of a
 // separately-watched app.example.com.
-async function purgeCapturedAuthForDomain(domain) {
-  const others = watchedDomainsCache.filter(d => d !== domain);
+// Purge exactly the hosts this domain OWNS, ownership being longest-suffix
+// match. Asking instead "is some OTHER watched domain interested in this host"
+// was wrong in the child direction: a watched parent always matched, so
+// logging out of app.example.com retired nothing and the next sync
+// re-collected and re-published the dead credential.
+//
+// `domain` is folded into the ownership scope explicitly because removeDomain
+// purges AFTER dropping it from the watch list.
+async function purgeCapturedAuthForDomain(domain, watched = watchedDomainsCache) {
+  const scope = watched.includes(domain) ? watched : [...watched, domain];
   let purged = false;
   for (const host of Object.keys(capturedBearerTokens)) {
     if (host !== domain && !host.endsWith('.' + domain)) continue;
-    if (matchDomain(host, others)) continue; // owned by another watched domain
+    if (matchDomain(host, scope) !== domain) continue; // a more specific watch owns it
     delete capturedBearerTokens[host];
     purged = true;
   }
@@ -976,11 +1012,17 @@ async function purgeCapturedAuthForDomain(domain) {
 // Entries a previous version leaked into the wrong domain's last-known-good
 // stay there forever otherwise: mergeBearer starts from LKG and only ever adds.
 // Filtering on the way in retires already-stored cross-domain credentials.
-function ownedBearerTokens(byHost, domain) {
+// `watched` comes from a fresh storage read, not the in-memory cache:
+// hydration swallows its own failures, and an empty cache would make this
+// discard every stored token as "unowned" — turning a transient startup error
+// into permanent credential loss. An unknown watch set never destroys.
+function ownedBearerTokens(byHost, domain, watched) {
+  if (!watched || !watched.length) return { ...(byHost || {}) };
+  const scope = watched.includes(domain) ? watched : [...watched, domain];
   const out = {};
   for (const [host, val] of Object.entries(byHost || {})) {
     if (host !== domain && !host.endsWith('.' + domain)) continue;
-    if (matchDomain(host, watchedDomainsCache) !== domain) continue;
+    if (matchDomain(host, scope) !== domain) continue;
     out[host] = val;
   }
   return out;

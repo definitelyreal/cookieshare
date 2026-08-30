@@ -20,6 +20,23 @@ async function prefetchScope(raw) {
   if (scopeCache.raw === raw) scopeCache.value = scope;
 }
 
+// Synchronous fallback for the case where the click beats the prefetch (type
+// fast, hit Add immediately). Requests ONLY the domain's own origins — always
+// narrower than the real scope, never broader, and critically it needs no
+// await, so the user gesture survives. Light normalization only; the
+// background still normalizes and validates authoritatively on addDomain.
+function localFallbackScope(raw) {
+  const d = String(raw).trim().toLowerCase()
+    .replace(/^[a-z][a-z0-9+.-]*:\/\//, '')
+    .replace(/^[^/@]*@/, '')
+    .replace(/[/?#].*$/, '')
+    .replace(/:\d+$/, '')
+    .replace(/^www\./, '')
+    .replace(/\.$/, '');
+  if (!d.includes('.') || !/^[a-z0-9.-]+$/.test(d)) return null;
+  return { domain: d, origins: [`*://${d}/*`, `*://*.${d}/*`], partial: true };
+}
+
 // ============================================================
 // Init
 // ============================================================
@@ -196,7 +213,7 @@ async function handleAddDomain() {
     // real scope, never broader — if the prefetch has not landed yet.
     const scope = (scopeCache.raw === raw && scopeCache.value)
       ? scopeCache.value
-      : await resolveScope(raw);
+      : localFallbackScope(raw);
     if (!scope || scope.error || !scope.origins) {
       showAddError(`"${raw}" is not a valid domain.`);
       return;
