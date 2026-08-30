@@ -163,13 +163,24 @@ The secret value is compressed JSON:
 
 ### Quick Version
 
+`extension/manifest.json` is **generated**, not committed. Run `./setup.sh` before loading the
+extension, or Chrome will refuse it with "Manifest file is missing or unreadable."
+
+```bash
+cp config.local.json.example config.local.json   # then edit it
+./setup.sh
+```
+
 1. Enable the Secret Manager API in your GCP project
 2. Create an OAuth 2.0 Client ID (Web Application type)
-3. Load the extension unpacked in Chrome, note the Extension ID
-4. Set the OAuth redirect URI to `https://<your-extension-id>.chromiumapp.org/`
-5. Paste your Client ID into `extension/manifest.json`
-6. Open the extension's Options page and enter your GCP Project ID
-7. Click "Sync This Site" on any page — done
+3. Put the Client ID and your GCP project ID in `config.local.json`, then run `./setup.sh`
+4. Load the extension unpacked in Chrome (select the `extension/` folder), note the Extension ID
+5. Set the OAuth redirect URI to `https://<your-extension-id>.chromiumapp.org/`
+6. Click "Sync This Site" on any page — done
+
+Re-run `./setup.sh` any time you change `config.local.json`, then reload the extension in
+`chrome://extensions`. Setting `extension_key` in `config.local.json` pins a stable Extension ID
+so the redirect URI keeps working across reloads and path changes.
 
 ## Usage
 

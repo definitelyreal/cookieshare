@@ -31,11 +31,30 @@ If you don't have a GCP project yet, create one at [console.cloud.google.com](ht
 
 We need to load the extension first to get its Extension ID, which we'll need for the OAuth setup.
 
+First, generate the private files. `extension/manifest.json` is **not** in the repo — it's built
+from `extension/manifest.template.json` plus your `config.local.json`, and it's gitignored:
+
+```bash
+cp config.local.json.example config.local.json   # skip if you already have one
+./setup.sh
+```
+
+Leave `oauth_client_id` as the placeholder for now; you'll fill it in at Step 4.
+
+> If you skip this, Chrome rejects the folder with **"Manifest file is missing or unreadable —
+> Could not load manifest."** That means `extension/manifest.json` hasn't been generated yet, not
+> that anything is broken. Run `./setup.sh` and load it again.
+
 1. Open `chrome://extensions/` in Chrome
 2. Enable **Developer mode** (toggle in the top right)
 3. Click **Load unpacked**
 4. Select the `extension/` folder from this repo
 5. Note the **Extension ID** shown on the card — you'll need this in the next step
+
+> To keep that Extension ID stable across reloads and folder moves, put a base64 public key in
+> `extension_key` in `config.local.json` and re-run `./setup.sh`. Otherwise Chrome derives the ID
+> from the folder path, and moving the repo changes it — which breaks the redirect URI you're
+> about to register.
 
 > The Extension ID is a 32-character string like `abcdefghijklmnopqrstuvwxyz012345`. It's displayed under the extension name on the card.
 
@@ -68,23 +87,31 @@ We need to load the extension first to get its Extension ID, which we'll need fo
 
 ## Step 4: Configure the Extension
 
-1. Open `extension/manifest.json` in your text editor
-2. Replace `YOUR_CLIENT_ID_HERE.apps.googleusercontent.com` with the Client ID you just copied:
+Edit `config.local.json`, not `extension/manifest.json` — the manifest is regenerated from the
+template every time you run `./setup.sh`, so hand edits to it are overwritten.
+
+1. Open `config.local.json` in your text editor
+2. Set `oauth_client_id` to the Client ID you just copied, and `gcp_project_id` to your project:
 
    ```json
-   "oauth2": {
-     "client_id": "123456789-abcdef.apps.googleusercontent.com",
-     "scopes": [
-       "https://www.googleapis.com/auth/cloud-platform"
-     ]
+   {
+     "oauth_client_id": "123456789-abcdef.apps.googleusercontent.com",
+     "gcp_project_id": "my-gcp-project",
+     "extension_key": ""
    }
    ```
 
-3. Go back to `chrome://extensions/` and click the **reload** button (circular arrow) on the cookieshare card
+3. Run `./setup.sh` again to write the Client ID into `extension/manifest.json` and your project ID
+   into `extension/local-config.json`
+4. Go back to `chrome://extensions/` and click the **reload** button (circular arrow) on the cookieshare card
 
 ---
 
 ## Step 5: Set Your GCP Project ID
+
+If you set `gcp_project_id` in `config.local.json` and ran `./setup.sh`, this is already done —
+the extension reads it from the generated `extension/local-config.json`. To override it per
+browser profile, or if you skipped it:
 
 1. Right-click the cookieshare extension icon → **Options** (or click "Manage Sites" in the popup)
 2. Scroll to **Settings**
@@ -153,9 +180,17 @@ Your Google account doesn't have Secret Manager permissions. See [Step 6](#step-
 
 ### OAuth popup doesn't appear
 
-- Make sure the Client ID in `manifest.json` matches what you created in GCP
+- Make sure `oauth_client_id` in `config.local.json` matches what you created in GCP, and that you
+  re-ran `./setup.sh` afterward (that's what writes it into `extension/manifest.json`)
 - Make sure the redirect URI in GCP includes your exact Extension ID
-- Reload the extension after changing `manifest.json`
+- Reload the extension after re-running `./setup.sh`
+
+### "Manifest file is missing or unreadable" / "Could not load manifest"
+
+`extension/manifest.json` hasn't been generated. It's gitignored and built by `./setup.sh` from
+`extension/manifest.template.json` plus `config.local.json`, so it's absent after a fresh clone, a
+`git clean -x`, or if the file was deleted. Run `./setup.sh` from the repo root and load the
+`extension/` folder again.
 
 ### "Payload too large" error
 
