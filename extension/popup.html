@@ -85,13 +85,16 @@
         Stops syncing and clears local data. <strong>The secret already stored in Google is
         kept</strong> — delete it separately below.
       </p>
-      <button id="btn-delete-secret" class="btn btn-danger btn-block hidden">Delete cloud secret</button>
     </div>
 
     <!-- State: no usable site (chrome://, new tab, etc.) -->
     <div id="no-site-section" class="section hidden">
       <p class="muted">Open a website to sync its session.</p>
     </div>
+
+    <!-- Outside the state sections on purpose: it stays reachable after
+         "Stop syncing" switches the panel back to the add state. -->
+    <button id="btn-delete-secret" class="btn btn-danger btn-block hidden">Delete cloud secret</button>
 
     <!-- Persistent: cleared by the next successful action, never on a timer. -->
     <p id="status-line" class="status-line hidden" role="status" aria-live="polite"></p>

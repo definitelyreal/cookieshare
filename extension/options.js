@@ -5,6 +5,21 @@ const $ = (sel) => document.querySelector(sel);
 let syncIntervalMin = 15;
 const pendingRemoval = new Set(); // domains armed for a confirming second click
 
+// Permission scope for whatever is currently typed, resolved ahead of the
+// click so the Add handler never awaits before chrome.permissions.request.
+const scopeCache = { raw: null, value: null };
+async function resolveScope(raw) {
+  const scope = await sendMessage({ type: 'getOrigins', domain: raw }).catch(() => null);
+  return scope && scope.origins ? scope : null;
+}
+async function prefetchScope(raw) {
+  if (!raw || scopeCache.raw === raw) return;
+  scopeCache.raw = raw;
+  scopeCache.value = null;
+  const scope = await resolveScope(raw);
+  if (scopeCache.raw === raw) scopeCache.value = scope;
+}
+
 // ============================================================
 // Init
 // ============================================================
@@ -30,7 +45,10 @@ document.addEventListener('DOMContentLoaded', async () => {
   $('#input-domain').addEventListener('keydown', (e) => {
     if (e.key === 'Enter') handleAddDomain();
   });
-  $('#input-domain').addEventListener('input', () => toggle('#add-error', false));
+  $('#input-domain').addEventListener('input', (e) => {
+    toggle('#add-error', false);
+    prefetchScope(e.target.value.trim());
+  });
   $('#btn-sync-all').addEventListener('click', handleSyncAll);
   $('#btn-auth').addEventListener('click', handleAuth);
   $('#btn-auth-2').addEventListener('click', handleAuth);
@@ -172,11 +190,14 @@ async function handleAddDomain() {
   toggle('#add-error', false);
 
   try {
-    // Ask the background for the permission scope so both entry points request
-    // the same thing. The popup used to walk every parent suffix here and could
-    // request "*://*.co.uk/*"; this stops at the registrable domain.
-    const scope = await sendMessage({ type: 'getOrigins', domain: raw });
-    if (scope.error || !scope.origins) {
+    // Scope is resolved as the user types (see the 'input' handler) so no
+    // await sits between this click and permissions.request, which needs the
+    // user gesture. Falls back to the domain's own origins — narrower than the
+    // real scope, never broader — if the prefetch has not landed yet.
+    const scope = (scopeCache.raw === raw && scopeCache.value)
+      ? scopeCache.value
+      : await resolveScope(raw);
+    if (!scope || scope.error || !scope.origins) {
       showAddError(`"${raw}" is not a valid domain.`);
       return;
     }
@@ -210,15 +231,21 @@ async function handleSyncAll() {
 
   // syncAll now reports real counts. It used to return {ok:true} no matter
   // what, so a run where every domain failed looked like a clean one.
-  const res = await sendMessage({ type: 'syncAll' });
-  await refresh();
-
-  btn.textContent = 'Sync All';
-  btn.disabled = false;
+  let res;
+  try {
+    res = await sendMessage({ type: 'syncAll' });
+    await refresh();
+  } catch (e) {
+    setStatus(e.message || 'Sync All failed.', 'error');
+    return;
+  } finally {
+    btn.textContent = 'Sync All';
+    btn.disabled = false;
+  }
 
   if (!res || typeof res.total !== 'number') return;
   if (res.total === 0) setStatus('No domains to sync.', 'warn');
-  else if (res.failed === 0) setStatus(`Synced ${res.ok} of ${res.total}.`, 'ok');
+  else if (res.failed === 0) setStatus(`Synced ${res.succeeded} of ${res.total}.`, 'ok');
   else {
     const first = res.errors?.[0];
     setStatus(`${res.failed} of ${res.total} failed${first ? ` — ${first.domain}: ${first.error}` : ''}.`, 'error');
@@ -306,11 +333,14 @@ async function refreshSetupState() {
   const { domains } = await sendMessage({ type: 'getDomains' });
   const hasDomain = domains.length > 0;
 
+  // Non-interactive probe — reports sign-in state without opening a dialog.
+  const auth = await sendMessage({ type: 'authStatus' }).catch(() => ({ signedIn: false }));
+  const signedIn = !!auth?.signedIn;
+
+  mark('#step-auth', signedIn);
   mark('#step-project', hasProject);
   mark('#step-domain', hasDomain);
-  // Auth is not probed here: a silent check would either prompt or lie. It is
-  // marked once the user signs in from this page.
-  toggle('#setup-section', !(hasProject && hasDomain));
+  toggle('#setup-section', !(signedIn && hasProject && hasDomain));
 }
 
 function mark(sel, done) {

@@ -5,6 +5,7 @@ const $ = (sel) => document.querySelector(sel);
 
 let currentDomain = null;
 let cachedOrigins = null;   // fetched at load so no await sits inside the click
+let hasPermission = false;  // ditto — checked at load, not mid-gesture
 let syncIntervalMin = 15;
 let stopArmed = false;
 
@@ -30,6 +31,9 @@ document.addEventListener('DOMContentLoaded', async () => {
     // user gesture, and an await between the click and the call can lose it.
     const resp = await sendMessage({ type: 'getOrigins', domain: currentDomain }).catch(() => null);
     if (resp?.origins) cachedOrigins = resp.origins;
+    hasPermission = await chrome.permissions
+      .contains({ origins: cachedOrigins || [`*://${currentDomain}/*`] })
+      .catch(() => false);
   }
 
   if (!currentDomain) {
@@ -140,13 +144,17 @@ async function loadSecretInfo(domain) {
 }
 
 async function checkAuth() {
-  // Only reports signed-out; it must not trigger an interactive prompt on open.
+  // Non-interactive probe: reports a signed-out state without popping a
+  // sign-in dialog just because the panel was opened.
   try {
     const { settings = {} } = await chrome.storage.local.get('settings');
     const local = await fetch(chrome.runtime.getURL('local-config.json')).then(r => r.ok ? r.json() : {}).catch(() => ({}));
     if (!settings.gcpProjectId && !local.gcpProjectId) {
       setStatus('No GCP project set. Open Options to finish setup.', 'warn');
+      return;
     }
+    const auth = await sendMessage({ type: 'authStatus' });
+    toggle('#auth-banner', !auth?.signedIn);
   } catch { /* non-fatal */ }
 }
 
@@ -225,8 +233,11 @@ async function handleSyncNow() {
   btn.disabled = true;
   clearStatus();
 
+  // No await before request(): permissions.request needs the click's user
+  // gesture, and an intervening await can lose it. `hasPermission` was
+  // resolved at load time for exactly this reason.
   const origins = cachedOrigins || [`*://${currentDomain}/*`, `*://*.${currentDomain}/*`];
-  let granted = await chrome.permissions.contains({ origins }).catch(() => false);
+  let granted = hasPermission;
   if (!granted) granted = await chrome.permissions.request({ origins }).catch(() => false);
   if (!granted) {
     setStatus('Host permission is needed to read this site’s cookies.', 'error');
@@ -234,12 +245,19 @@ async function handleSyncNow() {
     return;
   }
 
-  await sendMessage({ type: 'syncDomain', domain: currentDomain });
-  const { statuses } = await sendMessage({ type: 'getStatus' });
-  await showWatchedState(currentDomain, statuses[currentDomain]);
-  restore(btn, 'Sync Now');
-  const s = statuses[currentDomain] || {};
-  if (!s.error) setStatus(s.skipped ? 'Already up to date — nothing to upload.' : 'Uploaded.', 'ok');
+  // try/finally: a messaging failure used to leave the button spinning and
+  // disabled with no way back except reopening the popup.
+  try {
+    await sendMessage({ type: 'syncDomain', domain: currentDomain });
+    const { statuses } = await sendMessage({ type: 'getStatus' });
+    await showWatchedState(currentDomain, statuses[currentDomain]);
+    const s = statuses[currentDomain] || {};
+    if (!s.error) setStatus(s.skipped ? 'Already up to date — nothing to upload.' : 'Uploaded.', 'ok');
+  } catch (e) {
+    setStatus(e.message || 'Sync failed.', 'error');
+  } finally {
+    restore(btn, 'Sync Now');
+  }
 }
 
 // Two-step, because this is destructive and there is no undo: revoked
@@ -264,14 +282,18 @@ async function handleDeleteSecret() {
   const btn = $('#btn-delete-secret');
   setButtonSpinner(btn, 'Deleting...');
   btn.disabled = true;
-  const resp = await sendMessage({ type: 'deleteCloudSecret', domain: currentDomain });
-  btn.disabled = false;
-  btn.textContent = 'Delete cloud secret';
-  if (resp.ok) {
-    btn.classList.add('hidden');
-    setStatus(resp.alreadyGone ? 'No secret was stored in Google.' : `Deleted ${resp.secretId} from Google.`, 'ok');
-  } else {
-    setStatus(resp.error || 'Delete failed.', 'error');
+  try {
+    const resp = await sendMessage({ type: 'deleteCloudSecret', domain: currentDomain });
+    if (resp?.ok) {
+      btn.classList.add('hidden');
+      setStatus(resp.alreadyGone ? 'No secret was stored in Google.' : `Deleted ${resp.secretId} from Google.`, 'ok');
+    } else {
+      setStatus(resp?.error || 'Delete failed.', 'error');
+    }
+  } catch (e) {
+    setStatus(e.message || 'Delete failed.', 'error');
+  } finally {
+    restore(btn, 'Delete cloud secret');
   }
 }
 
@@ -302,14 +324,18 @@ async function handleSignIn() {
   const btn = $('#btn-signin');
   setButtonSpinner(btn);
   btn.disabled = true;
-  const resp = await sendMessage({ type: 'authenticate' });
-  btn.disabled = false;
-  btn.textContent = 'Sign in';
-  if (resp?.success) {
-    toggle('#auth-banner', false);
-    setStatus('Signed in.', 'ok');
-  } else {
-    setStatus(resp?.error || 'Sign-in failed.', 'error');
+  try {
+    const resp = await sendMessage({ type: 'authenticate' });
+    if (resp?.success) {
+      toggle('#auth-banner', false);
+      setStatus('Signed in.', 'ok');
+    } else {
+      setStatus(resp?.error || 'Sign-in failed.', 'error');
+    }
+  } catch (e) {
+    setStatus(e.message || 'Sign-in failed.', 'error');
+  } finally {
+    restore(btn, 'Sign in');
   }
 }
 

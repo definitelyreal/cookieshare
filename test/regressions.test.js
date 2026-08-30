@@ -21,6 +21,7 @@ const listener = { addListener: noop, removeListener: noop };
 
 let cookieResponse = [{ domain: '.example.com', name: 'sess', path: '/' }];
 let cookiesThrow = false;
+let cookiesThrowOnDomainQueryOnly = false; // authoritative query fails, URL queries succeed
 let versionPages = [{ versions: [] }];
 
 global.fetch = async (url, opts = {}) => {
@@ -53,7 +54,14 @@ global.chrome = {
   webRequest: { onBeforeSendHeaders: listener },
   cookies: {
     onChanged: listener,
-    getAll: async () => { if (cookiesThrow) throw new Error('no permission'); return cookieResponse; },
+    getAll: async (q = {}) => {
+      if (cookiesThrow) throw new Error('no permission');
+      // The {domain} form is the authoritative enumeration; {url} forms are
+      // supplementary. This lets a test fail only the authoritative one.
+      if (cookiesThrowOnDomainQueryOnly && q.domain) throw new Error('no permission');
+      if (cookiesThrowOnDomainQueryOnly) return [];
+      return cookieResponse;
+    },
   },
   tabs: { onUpdated: listener, onActivated: listener, query: async () => [] },
   alarms: {
@@ -257,7 +265,8 @@ async function test(name, fn) {
     const resp = await bg.handleMessage({ type: 'syncAll' });
     assert.strictEqual(resp.total, 1);
     assert.strictEqual(resp.failed, 1, 'the failure is counted');
-    assert.strictEqual(resp.ok, 0);
+    assert.strictEqual(resp.succeeded, 0);
+    assert.strictEqual(resp.ok, false, 'the handler flag reflects the failure');
     assert.strictEqual(resp.errors.length, 1);
     assert.ok(/project/i.test(resp.errors[0].error), 'the real reason is surfaced');
   });
@@ -329,6 +338,123 @@ async function test(name, fn) {
     cookiesThrow = false;
     assert.strictEqual(store['lkg_example.com'].cookies.length, 1,
       'a permission failure must never be mistaken for a logout');
+  });
+
+  // ==========================================================
+  // Findings from the fresh-verifier pass on a0056bf
+  // ==========================================================
+  await test('V1: a PARTIAL cookie-read failure is not treated as a logout', async () => {
+    store.domains = ['example.com'];
+    store.settings = { gcpProjectId: 'proj-1' };
+    store['lkg_example.com'] = {
+      cookies: [{ domain: '.example.com', name: 'sess', path: '/' }],
+      localStorage: { 'https://example.com': { tok: 'x' } },
+      sessionStorage: {}, indexedDB: {}, bearerTokens: {},
+    };
+    delete store['pushHash_example.com'];
+    // Authoritative {domain} query fails; the supplementary {url} queries
+    // succeed and return nothing. Marking that readable would wipe a live
+    // session — which is exactly what the first implementation did.
+    cookiesThrowOnDomainQueryOnly = true;
+    versionPages = [{ versions: [] }];
+    await bg.syncDomain('example.com', {});
+    cookiesThrowOnDomainQueryOnly = false;
+
+    assert.strictEqual(store['lkg_example.com'].cookies.length, 1, 'cookies survive a partial read failure');
+    assert.ok(store['lkg_example.com'].localStorage['https://example.com'], 'storage survives too');
+  });
+
+  await test('V2: completePendingAdd normalizes and enforces collisions', async () => {
+    store.domains = ['a-b.com'];
+    store.pendingAdd = 'a.b-com';   // collides with a-b.com
+    await bg.completePendingAdd();
+    assert.deepStrictEqual((await bg.handleMessage({ type: 'getDomains' })).domains, ['a-b.com'],
+      'the colliding domain was refused on the popup path too');
+
+    store.domains = [];
+    store.pendingAdd = 'HTTPS://WWW.Example.com/path';
+    await bg.completePendingAdd();
+    assert.deepStrictEqual((await bg.handleMessage({ type: 'getDomains' })).domains, ['example.com'],
+      'the popup path normalizes before storing');
+
+    store.domains = [];
+    store.pendingAdd = 'not a domain';
+    await bg.completePendingAdd();
+    assert.deepStrictEqual((await bg.handleMessage({ type: 'getDomains' })).domains, [],
+      'junk is discarded, not stored');
+  });
+
+  await test('V3: a public suffix cannot be added, so its origins are never requested', () => {
+    assert.strictEqual(bg.normalizeDomain('co.uk'), null);
+    assert.strictEqual(bg.normalizeDomain('com.au'), null);
+    assert.strictEqual(bg.isValidDomain('co.uk'), false);
+    assert.strictEqual(bg.normalizeDomain('example.co.uk'), 'example.co.uk', 'a real domain under it still works');
+  });
+
+  await test('V4: child auth already stored in a parent LKG is retired, not re-uploaded', async () => {
+    // completePendingAdd (used in V2) kicks off a sync it does not await, and
+    // syncDomain deliberately coalesces concurrent non-interactive calls — so
+    // drain that first, or this test silently measures the earlier sync.
+    await bg.syncDomain('example.com', { interactive: true }).catch(() => {});
+
+    store.domains = ['example.com', 'app.example.com'];
+    // The in-memory watch cache is what ownership is judged against, and it is
+    // only refreshed through handlers — set it explicitly.
+    bg._setWatchedDomainsCache(['example.com', 'app.example.com']);
+    store.settings = { gcpProjectId: 'proj-1' };
+    store['lkg_example.com'] = {
+      cookies: [{ domain: '.example.com', name: 'sess', path: '/' }],
+      localStorage: {}, sessionStorage: {}, indexedDB: {},
+      // Leaked there by an older build.
+      bearerTokens: {
+        'api.example.com': { token: 'PARENT', raw: 'Bearer PARENT' },
+        'api.app.example.com': { token: 'CHILD', raw: 'Bearer CHILD' },
+      },
+    };
+    delete store['pushHash_example.com'];
+    cookieResponse = [{ domain: '.example.com', name: 'sess', path: '/' }];
+    versionPages = [{ versions: [] }];
+
+    // interactive: true chains after any in-flight sync instead of reusing it.
+    await bg.syncDomain('example.com', { interactive: true });
+    const tokens = store['lkg_example.com'].bearerTokens;
+    assert.ok(!('api.app.example.com' in tokens), 'the child token was retired from the parent');
+    assert.ok('api.example.com' in tokens, 'the parent keeps its own token');
+  });
+
+  await test('V5: logging out of a parent keeps a watched child\'s captured auth', async () => {
+    store.domains = ['example.com', 'app.example.com'];
+    bg._setWatchedDomainsCache(['example.com', 'app.example.com']);
+    // Re-seed: earlier tests in this file legitimately purge these.
+    Object.assign(bg._capturedBearerTokens, {
+      'api.app.example.com': { token: 'CHILD', raw: 'Bearer CHILD' },
+      'api.example.com': { token: 'PARENT', raw: 'Bearer PARENT' },
+    });
+
+    await bg.purgeCapturedAuthForDomain('example.com');
+
+    const child = await bg.getBearerTokensForDomain('app.example.com');
+    assert.ok('api.app.example.com' in child, 'the separately-watched child was not collaterally purged');
+    const parent = await bg.getBearerTokensForDomain('example.com');
+    assert.ok(!('api.example.com' in parent), 'the parent\'s own token WAS purged');
+  });
+
+  await test('V6: destroyOldVersions reports an incomplete sweep instead of a clean one', async () => {
+    // Every page returns a nextPageToken, so the cap is hit with work outstanding.
+    versionPages = Array.from({ length: 25 }, () => ({
+      versions: [{ name: 'v/x', state: 'ENABLED', createTime: '2026-08-01T00:00:00Z' }],
+      nextPageToken: 'more',
+    }));
+    const res = await bg.destroyOldVersions('https://sm/v1/projects/p', 'sec', 1, {});
+    assert.strictEqual(res.incomplete, true, 'a truncated listing is reported as incomplete');
+  });
+
+  await test('V7: syncAll summary does not overwrite the handler\'s boolean ok', async () => {
+    store.domains = [];
+    const resp = await bg.handleMessage({ type: 'syncAll' });
+    assert.strictEqual(resp.ok, true, 'a zero-domain run is ok:true, not ok:0');
+    assert.strictEqual(resp.succeeded, 0);
+    assert.strictEqual(typeof resp.ok, 'boolean');
   });
 
   console.log(`\n${passed} passed, ${failed} failed`);
