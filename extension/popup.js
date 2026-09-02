@@ -203,7 +203,16 @@ async function handleAddDomain() {
   clearStatus();
 
   try {
-    const origins = cachedOrigins || [`*://${currentDomain}/*`, `*://*.${currentDomain}/*`];
+    if (!cachedOrigins) {
+      // Falling back to the domain's own origins looked harmless but was not:
+      // a subdomain would be added with no access to parent-domain cookies and
+      // still report as syncing. Better to fail visibly than to sync a session
+      // we cannot actually read.
+      setStatus('Could not work out the permissions needed. Reopen the popup and try again.', 'error');
+      restore(btn, 'Sync This Site');
+      return;
+    }
+    const origins = cachedOrigins;
     // `pendingAdd` was already written and awaited at popup open (see init), so
     // there is nothing to race here: the permission dialog can tear this popup
     // down at any moment and the background still knows what to finish.

@@ -66,8 +66,17 @@ class El {
 
 function buildDom(htmlFile) {
   const html = read(htmlFile);
-  const ids = [...html.matchAll(/id="([^"]+)"/g)].map(m => m[1]);
-  const byId = new Map(ids.map(id => [id, new El(id)]));
+  const byId = new Map();
+  // Seed each element's real starting classes from the markup. Without this
+  // every element began visible, so a test asserting "the banner is shown"
+  // passed whether or not production code ever revealed it.
+  for (const tag of html.match(/<[a-z][^>]*id="[^"]+"[^>]*>/g) || []) {
+    const id = tag.match(/id="([^"]+)"/)[1];
+    const el = new El(id);
+    const cls = tag.match(/class="([^"]*)"/);
+    if (cls) cls[1].split(/\s+/).filter(Boolean).forEach(c => el._classes.add(c));
+    byId.set(id, el);
+  }
   const doc = {
     _ready: [],
     addEventListener(ev, fn) { if (ev === 'DOMContentLoaded') doc._ready.push(fn); },
@@ -161,14 +170,28 @@ async function test(name, fn) {
 // slow probes land), so drain a few macrotask turns, not just one.
 const flush = async (n = 8) => { for (let i = 0; i < n; i++) await new Promise(r => setImmediate(r)); };
 
-// Does an await sit between the click and permissions.request? Exclude the
-// request's own `await`, which is expected.
-function awaitBeforeRequest(src, fnName) {
-  const start = src.indexOf(`async function ${fnName}`);
-  const end = src.indexOf('permissions.request', start);
-  const lines = src.slice(start, end).split('\n');
-  lines.pop(); // the request's own line, whose `await` is fine
-  return lines.some(l => /\bawait\b/.test(l) && !l.trim().startsWith('//') && !l.trim().startsWith('*'));
+// Text scanning proved unreliable here twice (it stopped at a comment, then it
+// flagged an await sitting in a branch that returns before the request). These
+// checks are behavioral instead: they record the real order of async calls and
+// assert nothing was awaited between the click and permissions.request, which
+// is the property that actually protects the user gesture.
+
+// Is `id` nested inside the element with id `containerId`? Depth-counted, so
+// it cannot be fooled by mere string position the way an indexOf check was.
+function isNestedIn(html, id, containerId) {
+  const open = html.indexOf(`id="${containerId}"`);
+  if (open < 0) return false;
+  let i = html.indexOf('>', open) + 1, depth = 1;
+  const tagRe = /<(\/?)div\b[^>]*>/g;
+  tagRe.lastIndex = i;
+  let m;
+  while ((m = tagRe.exec(html))) {
+    depth += m[1] ? -1 : 1;
+    if (depth === 0) {
+      return html.slice(open, m.index).includes(`id="${id}"`);
+    }
+  }
+  return false;
 }
 
 (async () => {
@@ -249,16 +272,34 @@ function awaitBeforeRequest(src, fnName) {
       'and the user is told the Google secret was kept');
   });
 
-  await test('popup: the cloud-delete button is not inside a section that Stop hides', () => {
+  await test('popup: the cloud-delete button is not inside any section that Stop hides', () => {
     const html = read('popup.html');
-    const statusEnd = html.indexOf('id="no-site-section"');
-    assert.ok(html.indexOf('id="btn-delete-secret"') > statusEnd,
-      'btn-delete-secret must live outside #status-section or it is unreachable after Stop');
+    for (const section of ['status-section', 'add-section', 'no-site-section']) {
+      assert.ok(!isNestedIn(html, 'btn-delete-secret', section),
+        `btn-delete-secret must not be inside #${section}, or it is unreachable when that section hides`);
+    }
   });
 
-  await test('popup: no await sits between the Add click and permissions.request', () => {
-    assert.ok(!awaitBeforeRequest(read('popup.js'), 'handleAddDomain'),
-      'an await before permissions.request can cost the user gesture');
+  await test('popup: nothing is awaited between the Add click and permissions.request', async () => {
+    const { doc, byId } = buildDom('popup.html');
+    const ch = makeChrome({ domains: [] }); // current site not yet watched
+    const log = [];
+    const realSend = ch.api.runtime.sendMessage;
+    ch.api.runtime.sendMessage = async (m) => { log.push(`msg:${m.type}`); return realSend(m); };
+    ch.api.storage.local.set = async () => { log.push('storage.set'); };
+    ch.api.permissions.request = async () => { log.push('permissions.request'); return true; };
+    runScript('popup.js', { doc, chrome: ch.api });
+    for (const fn of doc._ready) await fn();
+    await flush();
+
+    log.length = 0; // everything above is popup-open work, not click work
+    await byId.get('btn-sync-site').fire('click');
+    await flush();
+
+    const reqAt = log.indexOf('permissions.request');
+    assert.ok(reqAt >= 0, 'the click did reach permissions.request');
+    assert.deepStrictEqual(log.slice(0, reqAt), [],
+      `nothing may be awaited before the permission prompt; saw: ${log.slice(0, reqAt).join(', ')}`);
   });
 
   // ==========================================================
@@ -311,9 +352,56 @@ function awaitBeforeRequest(src, fnName) {
     assert.ok(/declined/.test(byId.get('status-line').textContent), 'the reason is shown');
   });
 
-  await test('options: the Add click does not await a message before requesting permission', () => {
-    assert.ok(!awaitBeforeRequest(read('options.js'), 'handleAddDomain'),
-      'scope must come from the prefetch cache or a synchronous fallback');
+  await test('options: an unvalidated scope never reaches a permission prompt', async () => {
+    const { doc, byId } = buildDom('options.html');
+    const ch = makeChrome({ settings: { gcpProjectId: 'p' }, domains: [] });
+    let requested = null;
+    ch.api.permissions.request = async ({ origins }) => { requested = origins; return true; };
+    runScript('options.js', { doc, chrome: ch.api });
+    for (const fn of doc._ready) await fn();
+    await flush();
+
+    // Click immediately, before any prefetch has run for this value.
+    byId.get('input-domain').value = 'co.uk';
+    await byId.get('btn-add').fire('click');
+    await flush();
+    assert.strictEqual(requested, null,
+      'a scope we have not validated must never be turned into a permission prompt');
+    assert.ok(!ch.sent.some(m => m.type === 'addDomain'), 'and nothing was added');
+  });
+
+  await test('options: once validated, the click prompts with the full scope and awaits nothing first', async () => {
+    const { doc, byId } = buildDom('options.html');
+    const ch = makeChrome({ settings: { gcpProjectId: 'p' }, domains: [] });
+    const log = [];
+    const realSend = ch.api.runtime.sendMessage;
+    ch.api.runtime.sendMessage = async (m) => {
+      log.push(`msg:${m.type}`);
+      if (m.type === 'getOrigins') {
+        // Full scope: own origins plus the registrable parent.
+        return { domain: m.domain, origins: [`*://${m.domain}/*`, `*://*.${m.domain}/*`, '*://example.com/*', '*://*.example.com/*'] };
+      }
+      return realSend(m);
+    };
+    ch.api.permissions.request = async ({ origins }) => { log.push('permissions.request'); return true; };
+    runScript('options.js', { doc, chrome: ch.api });
+    for (const fn of doc._ready) await fn();
+    await flush();
+
+    const input = byId.get('input-domain');
+    input.value = 'app.example.com';
+    await input.fire('input', { target: input });   // prefetch resolves the scope
+    await flush();
+
+    log.length = 0;
+    await byId.get('btn-add').fire('click');
+    await flush();
+
+    const reqAt = log.indexOf('permissions.request');
+    assert.ok(reqAt >= 0, 'the validated click reaches the prompt');
+    assert.deepStrictEqual(log.slice(0, reqAt), [],
+      `nothing may be awaited before the prompt; saw: ${log.slice(0, reqAt).join(', ')}`);
+    assert.ok(log.includes('msg:addDomain'), 'and the add proceeds afterwards');
   });
 
   console.log(`\n${passed} passed, ${failed} failed`);

@@ -17,6 +17,7 @@ const store = {
 
 const spies = { fetches: [], destroyed: [], alarmsCleared: [], alarmsCreated: [], permsRemoved: [] };
 let identityShouldFail = false;
+let heldPermissions = null; // what chrome.permissions.getAll() reports
 const noop = () => {};
 const listener = { addListener: noop, removeListener: noop };
 
@@ -72,8 +73,15 @@ global.chrome = {
     clear: async (n) => { spies.alarmsCleared.push(n); return true; },
   },
   permissions: {
-    remove: async (o) => { spies.permsRemoved.push(o); return true; },
+    remove: async (o) => {
+      spies.permsRemoved.push(o);
+      if (heldPermissions) {
+        heldPermissions.origins = heldPermissions.origins.filter(x => !o.origins.includes(x));
+      }
+      return true;
+    },
     contains: async () => true,
+    getAll: async () => heldPermissions || { origins: [] },
     onAdded: listener,
     onRemoved: listener,
   },
@@ -602,6 +610,60 @@ async function test(name, fn) {
     const resp = await bg.handleMessage({ type: 'addDomain', domain: 'a.b-com' });
     assert.ok(resp.error, 'still refused');
     assert.ok(spies.permsRemoved.length > 0, 'the grant obtained for the refused domain is returned');
+  });
+
+  await test('X6: a grant for a PARENT does not silently adopt a pending child intent', async () => {
+    // Intent is recorded when the popup opens, so it can outlive the popup.
+    // permissions.contains() does pattern subsumption — granting
+    // *://*.example.com/* for example.com would also "contain" the child's
+    // origins and start watching a domain the user never chose.
+    store.domains = [];
+    bg._setWatchedDomainsCache([]);
+    store.pendingAdd = 'app.example.com';
+
+    await bg.completePendingAdd({ origins: ['*://example.com/*', '*://*.example.com/*'] });
+
+    assert.deepStrictEqual((await bg.handleMessage({ type: 'getDomains' })).domains, [],
+      'the child must NOT be adopted by the parent\'s grant');
+    assert.strictEqual(store.pendingAdd, 'app.example.com', 'and the intent is left standing');
+
+    // The child's own grant still completes it.
+    await bg.completePendingAdd({ origins: ['*://app.example.com/*', '*://*.app.example.com/*'] });
+    assert.deepStrictEqual((await bg.handleMessage({ type: 'getDomains' })).domains, ['app.example.com']);
+  });
+
+  await test('X7: an upgrade reclaims over-broad grants an older build requested', async () => {
+    // Old builds walked every parent suffix and never gave the grants back.
+    heldPermissions = {
+      origins: [
+        '*://app.example.com/*', '*://*.app.example.com/*',
+        '*://example.com/*', '*://*.example.com/*',
+        '*://*.co.uk/*',            // public-suffix grant from an older build
+        '*://*.amazonaws.com/*',    // registry-wide grant from an older build
+        '*://unrelated.org/*',      // for a domain no longer watched
+      ],
+    };
+    spies.permsRemoved = [];
+    await bg.handleMessage({ type: 'importState', state: { domains: ['app.example.com'] } });
+
+    const res = await bg.reclaimStrayOrigins();
+    assert.ok(res.removed.includes('*://*.co.uk/*'), 'public-suffix grant reclaimed');
+    assert.ok(res.removed.includes('*://*.amazonaws.com/*'), 'registry-wide grant reclaimed');
+    assert.ok(res.removed.includes('*://unrelated.org/*'), 'grant for an unwatched domain reclaimed');
+    assert.ok(!res.removed.includes('*://*.example.com/*'),
+      'the registrable parent the watched subdomain needs is kept');
+    assert.ok(!res.removed.includes('*://app.example.com/*'), 'the watched domain keeps its own');
+  });
+
+  await test('X8: revocation re-reads the watch list, so a concurrent add is not stripped', async () => {
+    spies.permsRemoved = [];
+    await bg.handleMessage({ type: 'importState', state: { domains: ['app.example.com', 'api.example.com'] } });
+    // Both need *://*.example.com/*; removing one must not take it away.
+    await bg.handleMessage({ type: 'removeDomain', domain: 'app.example.com' });
+    const removed = spies.permsRemoved.flatMap(o => o.origins || []);
+    assert.ok(!removed.includes('*://*.example.com/*'),
+      'the parent scope the remaining sibling needs must survive');
+    assert.ok(removed.includes('*://app.example.com/*'));
   });
 
   console.log(`\n${passed} passed, ${failed} failed`);

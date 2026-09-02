@@ -173,6 +173,10 @@ const MULTI_LABEL_SUFFIXES = new Set([
   'translate.goog', 'glitch.me', 'onrender.com', 'fly.dev', 'ngrok.io',
 ]);
 
+const MAX_SUFFIX_LABELS = Math.max(
+  2, ...[...MULTI_LABEL_SUFFIXES].map(s => s.split('.').length)
+);
+
 // The shortest ancestor of `host` that a person could actually register, e.g.
 // app.example.co.uk -> example.co.uk. Returns host itself when it is already at
 // or below that boundary.
@@ -182,7 +186,9 @@ const MULTI_LABEL_SUFFIXES = new Set([
 function registrableDomain(host) {
   const parts = String(host || '').split('.').filter(Boolean);
   if (parts.length <= 2) return parts.join('.');
-  for (let n = Math.min(4, parts.length - 1); n >= 2; n--) {
+  // Ceiling derived from the set, so adding a longer suffix entry later cannot
+  // silently become dead code the way the old hard-coded bound did.
+  for (let n = Math.min(MAX_SUFFIX_LABELS, parts.length - 1); n >= 2; n--) {
     if (MULTI_LABEL_SUFFIXES.has(parts.slice(-n).join('.'))) {
       return parts.slice(-(n + 1)).join('.');
     }
@@ -208,14 +214,49 @@ function originsForDomain(domain) {
 // domain still needs. Removal used to revoke only the domain's own two
 // origins, so the registrable-parent grant it had requested stayed behind
 // forever; a refused add left the whole grant in place.
-async function revokeOriginsFor(domain, remaining) {
+// The watched set is re-read HERE rather than taken from the caller: the
+// caller's snapshot is taken under the domains lock but revocation happens
+// after the lock is released and after further awaits, so a concurrent add
+// could otherwise have its parent scope revoked out from under it.
+async function revokeOriginsFor(domain) {
+  const remaining = (await getDomains()).filter(d => d !== domain);
   const keep = new Set();
-  for (const d of remaining || []) for (const o of originsForDomain(d)) keep.add(o);
+  for (const d of remaining) for (const o of originsForDomain(d)) keep.add(o);
   const origins = originsForDomain(domain).filter(o => !keep.has(o));
   if (!origins.length) return [];
   try { await chrome.permissions.remove({ origins }); }
   catch (e) { console.warn('[CookieShare:bg] permission cleanup failed:', e.message); }
   return origins;
+}
+
+// Reclaim host grants no watched domain needs. Earlier builds asked for
+// origins this one never would — every parent suffix of a domain, up to and
+// including public suffixes like *://*.co.uk/* — and nothing ever gave those
+// back, so upgrading alone left the over-broad grants in place forever.
+// Runs on install/startup; only ever removes, never requests.
+async function reclaimStrayOrigins() {
+  if (!chrome.permissions?.getAll) return { removed: [] };
+  try {
+    const held = await chrome.permissions.getAll();
+    const heldOrigins = held?.origins || [];
+    if (!heldOrigins.length) return { removed: [] };
+
+    const needed = new Set();
+    for (const d of await getDomains()) for (const o of originsForDomain(d)) needed.add(o);
+
+    // <all_urls> is declared as an optional permission and may be held
+    // deliberately; leave anything we do not recognise as our own pattern.
+    const ours = /^\*:\/\/(\*\.)?[a-z0-9.-]+\/\*$/;
+    const stray = heldOrigins.filter(o => ours.test(o) && !needed.has(o));
+    if (!stray.length) return { removed: [] };
+
+    await chrome.permissions.remove({ origins: stray });
+    console.log(`[CookieShare:bg] Reclaimed ${stray.length} unused host permission(s)`);
+    return { removed: stray };
+  } catch (e) {
+    console.warn('[CookieShare:bg] stray-permission reclaim failed:', e.message);
+    return { removed: [] };
+  }
 }
 
 // ============================================================
@@ -312,7 +353,7 @@ async function handleMessage(msg) {
       if (clash) {
         // The caller already prompted for host permission before reaching us,
         // so give it back rather than holding access to a domain we refused.
-        await revokeOriginsFor(domain, domains);
+        await revokeOriginsFor(domain);
         return {
           error: `"${domain}" and the already-watched "${clash}" both map to the secret ${secretIdForDomain(domain)}. Remove one first.`,
           domains,
@@ -342,7 +383,7 @@ async function handleMessage(msg) {
       // Least privilege: hand back everything this domain caused us to hold
       // that no remaining watched domain still needs — including the
       // registrable-parent grant, which used to be left behind permanently.
-      await revokeOriginsFor(msg.domain, domains);
+      await revokeOriginsFor(msg.domain);
       // `domains` is the post-removal list, so the purge folds msg.domain back
       // into the ownership scope itself.
       await purgeCapturedAuthForDomain(msg.domain, domains);
@@ -551,10 +592,11 @@ async function registerWebRequestForWatched() {
 }
 
 // Re-arm whenever host permissions or the watched set change.
-if (chrome.permissions?.onAdded) chrome.permissions.onAdded.addListener(() => {
+if (chrome.permissions?.onAdded) chrome.permissions.onAdded.addListener((granted) => {
   // The permission dialog closes the popup, so finish the pending add here — no
-  // re-click. Then re-arm capture for the now-granted domain.
-  completePendingAdd().catch(() => {}).finally(() => registerWebRequestForWatched().catch(() => {}));
+  // re-click. The event payload is passed through because it names exactly what
+  // was granted; see completePendingAdd for why that matters.
+  completePendingAdd(granted).catch(() => {}).finally(() => registerWebRequestForWatched().catch(() => {}));
 });
 if (chrome.permissions?.onRemoved) chrome.permissions.onRemoved.addListener(() => registerWebRequestForWatched().catch(() => {}));
 // Arm capture as early as possible rather than waiting on hydration —
@@ -565,7 +607,7 @@ registerWebRequestForWatched().catch(err =>
 
 // When the user grants host permission from the popup, the popup is torn down by
 // the dialog before it can add the domain. Finish the job here.
-async function completePendingAdd() {
+async function completePendingAdd(granted = null) {
   const { pendingAdd: raw } = await chrome.storage.local.get('pendingAdd');
   if (!raw) return;
   // This is the popup's REAL add path (the permission dialog tears the popup
@@ -580,7 +622,22 @@ async function completePendingAdd() {
     return;
   }
   const origins = [`*://${pendingAdd}/*`, `*://*.${pendingAdd}/*`];
-  if (!(await chrome.permissions.contains({ origins }))) return; // not the domain that was granted
+
+  // Intent is recorded when the popup OPENS (so the permission dialog cannot
+  // tear it down before the write lands), which means a stale intent can
+  // outlive the popup. permissions.contains() alone is not enough to retire it
+  // safely: it does pattern subsumption, so granting "*://*.example.com/*"
+  // while adding example.com from the options page would ALSO satisfy a
+  // pending intent for app.example.com and silently start watching a domain
+  // the user never chose — creating an overlapping parent/child watch.
+  //
+  // The onAdded payload names literally what was granted, so when we have it,
+  // require the grant to actually mention this domain.
+  if (granted && Array.isArray(granted.origins)) {
+    if (!granted.origins.some(o => origins.includes(o))) return; // some other domain was granted
+  } else if (!(await chrome.permissions.contains({ origins }))) {
+    return;
+  }
   await chrome.storage.local.remove('pendingAdd');
 
   let refused = null;
@@ -599,7 +656,7 @@ async function completePendingAdd() {
     // Hand back the full grant this add caused, not just the candidate's own
     // origins: the popup requests the registrable parent too, and that part
     // was being left behind.
-    await revokeOriginsFor(pendingAdd, await getDomains());
+    await revokeOriginsFor(pendingAdd);
     // Surfaced by the popup on next open; nothing read this before.
     await chrome.storage.local.set({
       lastAddError: `"${pendingAdd}" and "${refused}" both map to the secret ${secretIdForDomain(pendingAdd)}. Remove one first.`,
@@ -1532,6 +1589,9 @@ chrome.runtime.onInstalled.addListener(() => {
   ensurePeriodicAlarm();
   ensureActiveTabAlarm();
   updateBadgeForActiveTab();
+  // An upgrade is exactly when over-broad grants from an older build are still
+  // held; nothing else would ever give them back.
+  hydrationDone.then(reclaimStrayOrigins).catch(() => {});
 });
 
 chrome.runtime.onStartup.addListener(() => {
@@ -1539,11 +1599,12 @@ chrome.runtime.onStartup.addListener(() => {
   ensurePeriodicAlarm();
   ensureActiveTabAlarm();
   updateBadgeForActiveTab();
+  hydrationDone.then(reclaimStrayOrigins).catch(() => {});
 });
 
 // Exposed for the Node test harness (no-op in the extension environment).
 if (typeof module !== 'undefined' && module.exports) {
-  module.exports = { matchDomain, mergeSnapshot, mergeByOrigin, mergeBearer, trimLargeValues, base64FromBytes, base64FromString, countOriginKeys, countIdbKeys, parseJwtExpMs, encodePayload, sha256Hex, getToken, invalidateToken, gsmFetch, handleMessage, syncDomain, completePendingAdd, normalizeDomain, isValidDomain, secretIdForDomain, secretIdCollision, countAuthTokens, countHeaderOnlyHosts, syncAlarmNames, domainFromSyncAlarm, destroyOldVersions, getBearerTokensForDomain, purgeCapturedAuthForDomain, registrableDomain, originsForDomain, syncAll, ownedBearerTokens,
+  module.exports = { matchDomain, mergeSnapshot, mergeByOrigin, mergeBearer, trimLargeValues, base64FromBytes, base64FromString, countOriginKeys, countIdbKeys, parseJwtExpMs, encodePayload, sha256Hex, getToken, invalidateToken, gsmFetch, handleMessage, syncDomain, completePendingAdd, normalizeDomain, isValidDomain, secretIdForDomain, secretIdCollision, countAuthTokens, countHeaderOnlyHosts, syncAlarmNames, domainFromSyncAlarm, destroyOldVersions, getBearerTokensForDomain, purgeCapturedAuthForDomain, registrableDomain, originsForDomain, syncAll, ownedBearerTokens, revokeOriginsFor, reclaimStrayOrigins,
     // Test-only handles on worker state that has no message-level accessor.
     _capturedBearerTokens: capturedBearerTokens,
     _setWatchedDomainsCache: (list) => { watchedDomainsCache = list; },

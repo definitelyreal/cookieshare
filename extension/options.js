@@ -54,7 +54,10 @@ document.addEventListener('DOMContentLoaded', async () => {
 
   $('#btn-add').addEventListener('click', handleAddDomain);
   $('#input-domain').addEventListener('keydown', (e) => {
-    if (e.key === 'Enter') handleAddDomain();
+    // Guard on the button's own disabled state: holding Enter used to launch
+    // concurrent permission requests and duplicate adds, because disabling the
+    // button does nothing to the keyboard path.
+    if (e.key === 'Enter' && !$('#btn-add').disabled) handleAddDomain();
   });
   $('#input-domain').addEventListener('input', (e) => {
     toggle('#add-error', false);
