@@ -1232,6 +1232,11 @@ async function getStorageForDomain(domain, watched = watchedDomainsCache) {
   const sessionStorageByOrigin = {};
   const indexedDBByOrigin = {};
 
+  // A tab merely EXISTING is not a successful read. If every injection fails
+  // (the tab closed or navigated mid-collection, or the page blocked it), we
+  // learned nothing — and reporting that as "read it, found nothing" let an
+  // empty result corroborate a false logout and wipe the stored session.
+  let anyRead = false;
   for (const tab of matchingTabs) {
     let origin;
     try { origin = new URL(tab.url).origin; } catch { continue; }
@@ -1242,6 +1247,7 @@ async function getStorageForDomain(domain, watched = watchedDomainsCache) {
       });
       const data = results[0]?.result;
       if (!data) continue;
+      anyRead = true;
       localStorageByOrigin[origin] = { ...(localStorageByOrigin[origin] || {}), ...(data.localStorage || {}) };
       sessionStorageByOrigin[origin] = { ...(sessionStorageByOrigin[origin] || {}), ...(data.sessionStorage || {}) };
       if (data.indexedDB && Object.keys(data.indexedDB).length) {
@@ -1255,7 +1261,7 @@ async function getStorageForDomain(domain, watched = watchedDomainsCache) {
     localStorage: localStorageByOrigin,
     sessionStorage: sessionStorageByOrigin,
     indexedDB: indexedDBByOrigin,
-    readable: true,
+    readable: anyRead,
   };
 }
 

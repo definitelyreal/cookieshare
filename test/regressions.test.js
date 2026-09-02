@@ -20,6 +20,7 @@ let identityShouldFail = false;
 let heldPermissions = null; // what chrome.permissions.getAll() reports
 let openTabs = [];          // what chrome.tabs.query() reports
 let tabStorage = {};        // per-tabId storage the injected script "returns"
+let scriptingShouldFail = false; // simulate a tab closing / injection blocked
 const noop = () => {};
 const listener = { addListener: noop, removeListener: noop };
 
@@ -68,7 +69,10 @@ global.chrome = {
     },
   },
   tabs: { onUpdated: listener, onActivated: listener, query: async () => openTabs },
-  scripting: { executeScript: async ({ target }) => [{ result: tabStorage[target.tabId] || { localStorage: {}, sessionStorage: {}, indexedDB: {} } }] },
+  scripting: { executeScript: async ({ target }) => {
+    if (scriptingShouldFail) throw new Error('Frame with ID 0 was removed.');
+    return [{ result: tabStorage[target.tabId] || { localStorage: {}, sessionStorage: {}, indexedDB: {} } }];
+  } },
   alarms: {
     onAlarm: listener,
     get: async () => null,
@@ -832,6 +836,42 @@ async function test(name, fn) {
     const removed = spies.permsRemoved.flatMap(o => o.origins || []);
     assert.ok(!removed.includes('*://*.example.com/*'),
       'the concurrently-added sibling keeps the parent scope it needs');
+  });
+
+  await test('Z1: a tab that exists but cannot be read is NOT a successful storage read', async () => {
+    store.domains = ['example.com'];
+    bg._setWatchedDomainsCache(['example.com']);
+    openTabs = [{ id: 7, url: 'https://example.com/', incognito: false }];
+    scriptingShouldFail = true;   // tab closed / navigated / injection blocked
+
+    const res = await bg.getStorageForDomain('example.com', ['example.com']);
+    scriptingShouldFail = false;
+    openTabs = [];
+    assert.strictEqual(res.readable, false,
+      'a failed injection must not be reported as "read it, found nothing"');
+  });
+
+  await test('Z2: a failed storage read cannot corroborate a false logout', async () => {
+    store.domains = ['example.com'];
+    bg._setWatchedDomainsCache(['example.com']);
+    store.settings = { gcpProjectId: 'proj-1' };
+    store['lkg_example.com'] = {
+      cookies: [{ domain: '.example.com', name: 'sess', path: '/' }],
+      localStorage: { 'https://example.com': { tok: 'x' } },
+      sessionStorage: {}, indexedDB: {}, bearerTokens: {},
+    };
+    delete store['pushHash_example.com'];
+    cookieResponse = [];   // cookies gone
+    openTabs = [{ id: 8, url: 'https://example.com/', incognito: false }];
+    scriptingShouldFail = true;  // ...but we could not actually check storage
+    versionPages = [{ versions: [] }];
+
+    await bg.syncDomain('example.com', { interactive: true });
+    scriptingShouldFail = false;
+    openTabs = [];
+
+    assert.ok(Object.keys(store['lkg_example.com'].localStorage).length > 0,
+      'an unverifiable read must never license destroying the stored session');
   });
 
   console.log(`\n${passed} passed, ${failed} failed`);
