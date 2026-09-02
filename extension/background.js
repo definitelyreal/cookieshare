@@ -1161,11 +1161,17 @@ async function getCookiesForDomain(domain, watched = watchedDomainsCache) {
   let readable = false;
   const push = (cookies) => {
     for (const c of cookies) {
-      // Same ownership rule as storage and auth headers: a cookie scoped to a
-      // host that a more specific watch owns is that watch's credential.
-      // A cookie on ".example.com" still belongs to example.com and is kept.
+      // Ownership applies only DOWNWARD. A cookie scoped to this domain or to
+      // one of its ancestors (".example.com" while watching app.example.com)
+      // is the session we are here to capture — dropping it lost the login
+      // outright, which is the whole reason the registrable parent is in the
+      // requested permission scope. Only a cookie scoped to a DESCENDANT can
+      // belong to someone else, and then only if a more specific watch owns it.
       const host = String(c.domain || '').replace(/^\./, '');
-      if (host && matchDomain(host, scope) !== domain) continue;
+      if (host) {
+        const ancestorOrSelf = host === domain || domain.endsWith('.' + host);
+        if (!ancestorOrSelf && matchDomain(host, scope) !== domain) continue;
+      }
       const key = `${c.domain}|${c.name}|${c.path}`;
       if (!seen.has(key)) { seen.add(key); allCookies.push(c); }
     }

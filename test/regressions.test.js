@@ -754,8 +754,50 @@ async function test(name, fn) {
     cookieResponse = [{ domain: '.example.com', name: 'sess', path: '/' }];
 
     const names = (r) => r.cookies.map(c => c.name).sort();
-    assert.deepStrictEqual(names(parent), ['shared'], 'parent keeps only what it owns');
-    assert.deepStrictEqual(names(child), ['childhostonly', 'childonly'], 'child keeps its own');
+    assert.deepStrictEqual(names(parent), ['shared'],
+      'the parent does not take the child-scoped cookies');
+    // The child keeps its own AND the shared parent-scoped cookie, which is
+    // very often where the actual session lives.
+    assert.deepStrictEqual(names(child), ['childhostonly', 'childonly', 'shared'],
+      'ownership applies downward only — an ancestor-scoped cookie is still the child\'s session');
+  });
+
+  await test('Y3b: a lone watched subdomain still gets its parent-scoped session cookie', async () => {
+    // The common real case: watch app.example.com, session lives on
+    // ".example.com". Dropping it lost the login and could then look like a
+    // logout and wipe everything.
+    const watched = ['app.example.com'];
+    store.domains = watched;
+    bg._setWatchedDomainsCache(watched);
+    cookieResponse = [{ domain: '.example.com', name: 'sess', path: '/' }];
+
+    const res = await bg.getCookiesForDomain('app.example.com', watched);
+    cookieResponse = [{ domain: '.example.com', name: 'sess', path: '/' }];
+
+    assert.deepStrictEqual(res.cookies.map(c => c.name), ['sess'],
+      'the parent-scoped session cookie must be captured');
+  });
+
+  await test('Y3c: a full sync of a lone subdomain does not wipe itself', async () => {
+    const watched = ['app.example.com'];
+    store.domains = watched;
+    bg._setWatchedDomainsCache(watched);
+    store.settings = { gcpProjectId: 'proj-1' };
+    store['lkg_app.example.com'] = {
+      cookies: [{ domain: '.example.com', name: 'sess', path: '/' }],
+      localStorage: {}, sessionStorage: {}, indexedDB: {}, bearerTokens: {},
+    };
+    delete store['pushHash_app.example.com'];
+    cookieResponse = [{ domain: '.example.com', name: 'sess', path: '/' }];
+    openTabs = [{ id: 9, url: 'https://app.example.com/', incognito: false }];
+    tabStorage = { 9: { localStorage: {}, sessionStorage: {}, indexedDB: {} } };
+    versionPages = [{ versions: [] }];
+
+    await bg.syncDomain('app.example.com', { interactive: true });
+    openTabs = []; tabStorage = {};
+
+    assert.strictEqual(store['lkg_app.example.com'].cookies.length, 1,
+      'the session survives a normal sync instead of being cleared as a logout');
   });
 
   await test('Y4: import purges state for domains it drops', async () => {
