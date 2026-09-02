@@ -176,12 +176,18 @@ const MULTI_LABEL_SUFFIXES = new Set([
 // The shortest ancestor of `host` that a person could actually register, e.g.
 // app.example.co.uk -> example.co.uk. Returns host itself when it is already at
 // or below that boundary.
+// Matches the LONGEST suffix first. Checking only the last two labels made
+// every three-label entry in the set dead: "tenant.s3.amazonaws.com" resolved
+// to "amazonaws.com" and would have asked for *://*.amazonaws.com/*.
 function registrableDomain(host) {
   const parts = String(host || '').split('.').filter(Boolean);
   if (parts.length <= 2) return parts.join('.');
-  const lastTwo = parts.slice(-2).join('.');
-  const take = MULTI_LABEL_SUFFIXES.has(lastTwo) ? 3 : 2;
-  return parts.slice(-take).join('.');
+  for (let n = Math.min(4, parts.length - 1); n >= 2; n--) {
+    if (MULTI_LABEL_SUFFIXES.has(parts.slice(-n).join('.'))) {
+      return parts.slice(-(n + 1)).join('.');
+    }
+  }
+  return parts.slice(-2).join('.');
 }
 
 // Host permissions needed to read a domain's cookies. A session cookie may be
@@ -195,6 +201,20 @@ function originsForDomain(domain) {
   if (parent && parent !== domain && parent.includes('.')) {
     origins.push(`*://${parent}/*`, `*://*.${parent}/*`);
   }
+  return origins;
+}
+
+// Hand back every origin `domain` caused us to hold that no REMAINING watched
+// domain still needs. Removal used to revoke only the domain's own two
+// origins, so the registrable-parent grant it had requested stayed behind
+// forever; a refused add left the whole grant in place.
+async function revokeOriginsFor(domain, remaining) {
+  const keep = new Set();
+  for (const d of remaining || []) for (const o of originsForDomain(d)) keep.add(o);
+  const origins = originsForDomain(domain).filter(o => !keep.has(o));
+  if (!origins.length) return [];
+  try { await chrome.permissions.remove({ origins }); }
+  catch (e) { console.warn('[CookieShare:bg] permission cleanup failed:', e.message); }
   return origins;
 }
 
@@ -290,6 +310,9 @@ async function handleMessage(msg) {
         return list;
       });
       if (clash) {
+        // The caller already prompted for host permission before reaching us,
+        // so give it back rather than holding access to a domain we refused.
+        await revokeOriginsFor(domain, domains);
         return {
           error: `"${domain}" and the already-watched "${clash}" both map to the secret ${secretIdForDomain(domain)}. Remove one first.`,
           domains,
@@ -316,9 +339,10 @@ async function handleMessage(msg) {
       await chrome.storage.local.remove([`syncStatus_${msg.domain}`, `lkg_${msg.domain}`, `pushHash_${msg.domain}`]);
       // Cancel any pending debounced sync so it can't resurrect the domain.
       await Promise.all(syncAlarmNames(msg.domain).map(n => chrome.alarms.clear(n)));
-      // Revoke this domain's own host permissions (least privilege). Only the
-      // domain's own origins — never parent origins a sibling might still need.
-      chrome.permissions.remove({ origins: [`*://*.${msg.domain}/*`, `*://${msg.domain}/*`] }).catch(() => {});
+      // Least privilege: hand back everything this domain caused us to hold
+      // that no remaining watched domain still needs — including the
+      // registrable-parent grant, which used to be left behind permanently.
+      await revokeOriginsFor(msg.domain, domains);
       // `domains` is the post-removal list, so the purge folds msg.domain back
       // into the ownership scope itself.
       await purgeCapturedAuthForDomain(msg.domain, domains);
@@ -572,9 +596,10 @@ async function completePendingAdd() {
   });
   if (refused) {
     console.warn(`[CookieShare:bg] Refused ${pendingAdd}: shares secret id with ${refused}`);
-    // Hand back the permission the user just granted — keeping host access for
-    // a domain we refused to watch is access we have no use for.
-    chrome.permissions.remove({ origins }).catch(() => {});
+    // Hand back the full grant this add caused, not just the candidate's own
+    // origins: the popup requests the registrable parent too, and that part
+    // was being left behind.
+    await revokeOriginsFor(pendingAdd, await getDomains());
     // Surfaced by the popup on next open; nothing read this before.
     await chrome.storage.local.set({
       lastAddError: `"${pendingAdd}" and "${refused}" both map to the secret ${secretIdForDomain(pendingAdd)}. Remove one first.`,

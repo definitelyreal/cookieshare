@@ -58,7 +58,13 @@ async function test(name, fn) {
     assert.ok(!('pushHash_partiful.com' in store), 'pushHash purged');
     assert.ok(spies.alarmsCleared.includes('sync-partiful.com'), 'pending debounce alarm cleared');
     assert.strictEqual(spies.permsRemoved.length, 1, 'host permissions revoked');
-    assert.deepStrictEqual(spies.permsRemoved[0].origins, ['*://*.partiful.com/*', '*://partiful.com/*'], 'only the domain’s own origins');
+    // partiful.com is already a registrable domain, so its grant is just its
+    // own two origins — nothing belonging to a sibling is touched. (Order is
+    // not significant; revocation is now driven by originsForDomain.)
+    assert.deepStrictEqual(
+      [...spies.permsRemoved[0].origins].sort(),
+      ['*://*.partiful.com/*', '*://partiful.com/*'].sort(),
+      'only the domain’s own origins');
   });
 
   await test('a sync for a domain removed after scheduling bails without pushing', async () => {

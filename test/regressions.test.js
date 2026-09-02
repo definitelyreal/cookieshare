@@ -552,6 +552,58 @@ async function test(name, fn) {
       'a signed-out browser reports signed-out even though getToken has a cached token');
   });
 
+  // ==========================================================
+  // Findings from the THIRD verification round (on a752434)
+  // ==========================================================
+  await test('X1: three-label suffixes work, so no registry-wide wildcard is requested', () => {
+    // Matching only the last two labels made every three-label entry dead.
+    assert.strictEqual(bg.registrableDomain('tenant.s3.amazonaws.com'), 'tenant.s3.amazonaws.com');
+    assert.ok(!bg.originsForDomain('tenant.s3.amazonaws.com').includes('*://*.amazonaws.com/*'),
+      'must never ask for the whole of amazonaws.com');
+    // Two-label suffixes still behave.
+    assert.strictEqual(bg.registrableDomain('app.example.co.uk'), 'example.co.uk');
+    assert.strictEqual(bg.registrableDomain('a.b.example.com'), 'example.com');
+  });
+
+  await test('X2: a legitimate subdomain is still watchable (the suffix guard is not overzealous)', () => {
+    assert.strictEqual(bg.normalizeDomain('app.example.com'), 'app.example.com');
+    assert.strictEqual(bg.normalizeDomain('deep.a.b.example.co.uk'), 'deep.a.b.example.co.uk');
+    assert.deepStrictEqual(bg.originsForDomain('app.example.com'),
+      ['*://app.example.com/*', '*://*.app.example.com/*', '*://example.com/*', '*://*.example.com/*'],
+      'the registrable parent is still included, so parent cookies remain readable');
+  });
+
+  await test('X3: removal hands back the registrable-parent grant too', async () => {
+    spies.permsRemoved = [];
+    store.domains = ['app.example.com'];
+    bg._setWatchedDomainsCache(['app.example.com']);
+    await bg.handleMessage({ type: 'removeDomain', domain: 'app.example.com' });
+    const removed = spies.permsRemoved.flatMap(o => o.origins);
+    assert.ok(removed.includes('*://*.example.com/*'),
+      'the parent origin the add requested must not be left behind');
+    assert.ok(removed.includes('*://app.example.com/*'));
+  });
+
+  await test('X4: removal keeps origins another watched domain still needs', async () => {
+    spies.permsRemoved = [];
+    // example.com stays watched, so its origins must survive removing the child.
+    await bg.handleMessage({ type: 'importState', state: { domains: ['app.example.com', 'example.com'] } });
+    await bg.handleMessage({ type: 'removeDomain', domain: 'app.example.com' });
+    const removed = spies.permsRemoved.flatMap(o => o.origins || []);
+    assert.ok(!removed.includes('*://*.example.com/*'),
+      'the still-watched parent keeps its own grant');
+    assert.ok(removed.includes('*://app.example.com/*'), 'the child\'s own origins still go back');
+  });
+
+  await test('X5: a refused collision hands back the FULL grant, parent included', async () => {
+    spies.permsRemoved = [];
+    store.domains = ['a-b.com'];
+    bg._setWatchedDomainsCache(['a-b.com']);
+    const resp = await bg.handleMessage({ type: 'addDomain', domain: 'a.b-com' });
+    assert.ok(resp.error, 'still refused');
+    assert.ok(spies.permsRemoved.length > 0, 'the grant obtained for the refused domain is returned');
+  });
+
   console.log(`\n${passed} passed, ${failed} failed`);
   process.exit(failed ? 1 : 0);
 })();

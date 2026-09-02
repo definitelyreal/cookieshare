@@ -20,22 +20,16 @@ async function prefetchScope(raw) {
   if (scopeCache.raw === raw) scopeCache.value = scope;
 }
 
-// Synchronous fallback for the case where the click beats the prefetch (type
-// fast, hit Add immediately). Requests ONLY the domain's own origins — always
-// narrower than the real scope, never broader, and critically it needs no
-// await, so the user gesture survives. Light normalization only; the
-// background still normalizes and validates authoritatively on addDomain.
-function localFallbackScope(raw) {
-  const d = String(raw).trim().toLowerCase()
-    .replace(/^[a-z][a-z0-9+.-]*:\/\//, '')
-    .replace(/^[^/@]*@/, '')
-    .replace(/[/?#].*$/, '')
-    .replace(/:\d+$/, '')
-    .replace(/^www\./, '')
-    .replace(/\.$/, '');
-  if (!d.includes('.') || !/^[a-z0-9.-]+$/.test(d)) return null;
-  return { domain: d, origins: [`*://${d}/*`, `*://*.${d}/*`], partial: true };
-}
+// Deliberately NO synchronous fallback scope. Guessing origins locally was
+// wrong twice over: a locally-shaped guess could ask for a public suffix
+// ("co.uk") before the background rejected it, and a legitimate subdomain
+// would silently be added with only its own origins, never the
+// registrable-parent scope its cookies need — leaving it permanently
+// under-permissioned while reporting as syncing.
+//
+// So if the click beats the prefetch, we do not prompt at all: resolve the
+// scope, then ask the user to click Add again. One extra click in a rare race
+// beats a wrong permission grant.
 
 // ============================================================
 // Init
@@ -211,11 +205,15 @@ async function handleAddDomain() {
     // await sits between this click and permissions.request, which needs the
     // user gesture. Falls back to the domain's own origins — narrower than the
     // real scope, never broader — if the prefetch has not landed yet.
-    const scope = (scopeCache.raw === raw && scopeCache.value)
-      ? scopeCache.value
-      : localFallbackScope(raw);
-    if (!scope || scope.error || !scope.origins) {
-      showAddError(`"${raw}" is not a valid domain.`);
+    const scope = (scopeCache.raw === raw) ? scopeCache.value : null;
+    if (!scope) {
+      // Not validated yet. Resolve now and stop — no permission prompt on a
+      // scope we have not confirmed.
+      const resolved = await resolveScope(raw);
+      scopeCache.raw = raw;
+      scopeCache.value = resolved;
+      if (!resolved) showAddError(`"${raw}" is not a valid domain.`);
+      else setStatus('Checked. Click Add again to grant access.', 'warn');
       return;
     }
     const granted = await chrome.permissions.request({ origins: scope.origins });

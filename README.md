@@ -196,11 +196,46 @@ The extension now watches that domain. Cookies sync automatically.
 
 ### Managing Sites
 
-Click **Manage Sites** in the popup (or right-click the extension → Options) to:
-- See all watched domains and their sync status
+Click **Options** in the popup (or right-click the extension → Options) to:
+- See all watched domains, their sync status, and which ones have auth expiring soon
 - Trigger manual syncs
-- Remove domains
+- Stop syncing a domain
 - Change your GCP Project ID or sync interval
+
+### Stop syncing vs. deleting the secret
+
+These are deliberately two different actions:
+
+- **Stop syncing** (popup) or the **✕** (options) stops the extension watching a domain, clears its
+  local state, and hands back the host permission. **The secret already stored in Google Secret
+  Manager is kept.** Both take a confirming second click.
+- **Delete cloud secret** destroys the stored secret in Google. Use this one if your goal is to
+  revoke the credential, not just stop updating it.
+
+Stopping does not revoke anything on its own. If a session was synced and you want it gone, delete
+the secret (or destroy its versions in the GCP console).
+
+### Reading a session back
+
+The popup shows the secret name for the current site and a **Copy command** button that gives you a
+ready-to-run line, project id included:
+
+```bash
+./scripts/pull-cookies.sh example.com --project my-project
+```
+
+Use that script rather than raw `gcloud`: payloads over ~32 KB are stored gzipped inside a
+`{"compressed":"gzip","data":"..."}` envelope, and the script unwraps both shapes.
+
+### What the status means
+
+- **Last upload** is the last time a version was actually written to Secret Manager. A sync whose
+  content is unchanged is a success but not an upload, so this can legitimately be older than the
+  last sync.
+- **synced / stale / failing** judges age against your configured sync interval, so you don't have
+  to do the arithmetic.
+- **Auth tokens** counts hosts an `Authorization` header was captured for. Hosts where only extra
+  `x-*` headers were seen are counted separately as "header-only".
 
 ### Pulling Session Data
 
