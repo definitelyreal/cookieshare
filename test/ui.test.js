@@ -172,9 +172,19 @@ const flush = async (n = 8) => { for (let i = 0; i < n; i++) await new Promise(r
 
 // Text scanning proved unreliable here twice (it stopped at a comment, then it
 // flagged an await sitting in a branch that returns before the request). These
-// checks are behavioral instead: they record the real order of async calls and
-// assert nothing was awaited between the click and permissions.request, which
-// is the property that actually protects the user gesture.
+// checks are behavioral instead.
+//
+// Detecting a SUSPENSION, not just call order: a microtask is queued right
+// before the click. If the handler reaches permissions.request without ever
+// yielding, the request stub runs before that microtask. Any `await` in
+// between — even `await Promise.resolve()` — lets the microtask run first,
+// which is exactly the yield that costs the user gesture.
+function gestureProbe() {
+  const state = { yielded: false, requestSawYield: null };
+  state.arm = () => { Promise.resolve().then(() => { state.yielded = true; }); };
+  state.onRequest = () => { if (state.requestSawYield === null) state.requestSawYield = state.yielded; };
+  return state;
+}
 
 // Is `id` nested inside the element with id `containerId`? Depth-counted, so
 // it cannot be fooled by mere string position the way an indexOf check was.
@@ -292,7 +302,11 @@ function isNestedIn(html, id, containerId) {
     for (const fn of doc._ready) await fn();
     await flush();
 
+    const probe = gestureProbe();
+    ch.api.permissions.request = async () => { probe.onRequest(); log.push('permissions.request'); return true; };
+
     log.length = 0; // everything above is popup-open work, not click work
+    probe.arm();
     await byId.get('btn-sync-site').fire('click');
     await flush();
 
@@ -300,6 +314,8 @@ function isNestedIn(html, id, containerId) {
     assert.ok(reqAt >= 0, 'the click did reach permissions.request');
     assert.deepStrictEqual(log.slice(0, reqAt), [],
       `nothing may be awaited before the permission prompt; saw: ${log.slice(0, reqAt).join(', ')}`);
+    assert.strictEqual(probe.requestSawYield, false,
+      'the handler must not yield before prompting, or the user gesture is lost');
   });
 
   // ==========================================================
@@ -383,7 +399,8 @@ function isNestedIn(html, id, containerId) {
       }
       return realSend(m);
     };
-    ch.api.permissions.request = async ({ origins }) => { log.push('permissions.request'); return true; };
+    const probe = gestureProbe();
+    ch.api.permissions.request = async () => { probe.onRequest(); log.push('permissions.request'); return true; };
     runScript('options.js', { doc, chrome: ch.api });
     for (const fn of doc._ready) await fn();
     await flush();
@@ -394,6 +411,7 @@ function isNestedIn(html, id, containerId) {
     await flush();
 
     log.length = 0;
+    probe.arm();
     await byId.get('btn-add').fire('click');
     await flush();
 
@@ -401,6 +419,8 @@ function isNestedIn(html, id, containerId) {
     assert.ok(reqAt >= 0, 'the validated click reaches the prompt');
     assert.deepStrictEqual(log.slice(0, reqAt), [],
       `nothing may be awaited before the prompt; saw: ${log.slice(0, reqAt).join(', ')}`);
+    assert.strictEqual(probe.requestSawYield, false,
+      'the handler must not yield before prompting, or the user gesture is lost');
     assert.ok(log.includes('msg:addDomain'), 'and the add proceeds afterwards');
   });
 

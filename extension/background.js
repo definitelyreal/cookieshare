@@ -480,8 +480,18 @@ async function handleMessage(msg) {
           if (clash) { rejected.push({ entry: d, reason: `collides with ${clash}` }); continue; }
           clean.push(d);
         }
+        const dropped = (await getDomains()).filter(d => !clean.includes(d));
         await chrome.storage.local.set({ domains: clean });
         watchedDomainsCache = clean;
+        // Import replaces the watch list wholesale, so treat anything it drops
+        // like a removal. Otherwise captured auth and last-known-good data for
+        // a dropped domain lingered, and could be re-attributed to a remaining
+        // parent on its next sync.
+        for (const d of dropped) {
+          await chrome.storage.local.remove([`syncStatus_${d}`, `lkg_${d}`, `pushHash_${d}`]);
+          await Promise.all(syncAlarmNames(d).map(n => chrome.alarms.clear(n)));
+          await purgeCapturedAuthForDomain(d, clean);
+        }
       }
       if (state.settings && typeof state.settings === 'object') {
         await chrome.storage.local.set({ settings: state.settings });
@@ -489,6 +499,8 @@ async function handleMessage(msg) {
       await ensurePeriodicAlarm(true);
       await ensureActiveTabAlarm();
       registerWebRequestForWatched().catch(() => {});
+      // Hand back host grants the imported list no longer justifies.
+      reclaimStrayOrigins().catch(() => {});
       return { ok: true, domains: await getDomains(), rejected };
     }
 
@@ -896,8 +908,8 @@ async function doSyncDomain(domain, { interactive = false } = {}) {
   try {
     // Collect fresh data, then merge over last-known-good so a read we could
     // not perform never pushes a field emptier than what we already have.
-    const { cookies, readable: cookiesReadable } = await getCookiesForDomain(domain);
-    const storage = await getStorageForDomain(domain);
+    const { cookies, readable: cookiesReadable } = await getCookiesForDomain(domain, watched);
+    const storage = await getStorageForDomain(domain, watched);
     const fresh = {
       cookies,
       localStorage: storage.localStorage,
@@ -915,9 +927,21 @@ async function doSyncDomain(domain, { interactive = false } = {}) {
     // Without this the LKG guard, which exists so a closed tab can't wipe a
     // captured session, also made logging out invisible: the old authenticated
     // session stayed synced to the cloud indefinitely.
-    const loggedOut = cookiesReadable
+    // Corroboration is required before destroying anything. Cookies going
+    // empty is suggestive, not conclusive: plenty of sites keep the session in
+    // localStorage or IndexedDB and would survive their cookies expiring. So
+    // the session is only declared dead when we could ALSO read storage and
+    // found nothing there either. With no tab open we cannot check, so we do
+    // not conclude — the cookie clearing below still happens, but the stored
+    // session is left intact.
+    const cookiesGone = cookiesReadable
       && fresh.cookies.length === 0
       && Array.isArray(lkg.cookies) && lkg.cookies.length > 0;
+    const storageEmpty = storage.readable
+      && countOriginKeys(fresh.localStorage) === 0
+      && countOriginKeys(fresh.sessionStorage) === 0
+      && countIdbKeys(fresh.indexedDB) === 0;
+    const loggedOut = cookiesGone && storageEmpty;
 
     let merged;
     if (loggedOut) {
@@ -1129,13 +1153,19 @@ function countHeaderOnlyHosts(byHost) {
 // are none" (an authoritative empty — the user logged out) from "the read
 // failed" (permission revoked / API error). Without that distinction an empty
 // result was always treated as unreadable, so a logout could never propagate.
-async function getCookiesForDomain(domain) {
+async function getCookiesForDomain(domain, watched = watchedDomainsCache) {
   const urls = [`https://${domain}`, `http://${domain}`, `https://www.${domain}`];
   const allCookies = [];
   const seen = new Set();
+  const scope = ownershipScope(watched, domain);
   let readable = false;
   const push = (cookies) => {
     for (const c of cookies) {
+      // Same ownership rule as storage and auth headers: a cookie scoped to a
+      // host that a more specific watch owns is that watch's credential.
+      // A cookie on ".example.com" still belongs to example.com and is kept.
+      const host = String(c.domain || '').replace(/^\./, '');
+      if (host && matchDomain(host, scope) !== domain) continue;
       const key = `${c.domain}|${c.name}|${c.path}`;
       if (!seen.has(key)) { seen.add(key); allCookies.push(c); }
     }
@@ -1158,15 +1188,30 @@ async function getCookiesForDomain(domain) {
 // localStorage / sessionStorage / IndexedDB collection
 // ============================================================
 
-async function getStorageForDomain(domain) {
+// Ownership scope: `domain` plus every other watched domain, so longest-suffix
+// matching can say which watch a host belongs to. Folded in explicitly because
+// callers sometimes run while the list is mid-change.
+function ownershipScope(watched, domain) {
+  const list = (watched && watched.length) ? watched : [domain];
+  return list.includes(domain) ? list : [...list, domain];
+}
+
+async function getStorageForDomain(domain, watched = watchedDomainsCache) {
   const settings = await getSettings();
   const tabs = await chrome.tabs.query({});
+  const scope = ownershipScope(watched, domain);
   const matchingTabs = tabs.filter(t => {
     if (!t.url) return false;
     if (t.incognito && !settings.captureIncognito) return false;
     try {
       const hostname = new URL(t.url).hostname;
-      return hostname === domain || hostname.endsWith('.' + domain);
+      if (hostname !== domain && !hostname.endsWith('.' + domain)) return false;
+      // A tab whose host belongs to a MORE specific watched domain holds that
+      // domain's session, not this one's. Without this, watching both
+      // example.com and app.example.com uploaded the child's localStorage,
+      // sessionStorage and IndexedDB into the parent's secret as well — the
+      // same cross-domain leak already fixed for captured auth headers.
+      return matchDomain(hostname, scope) === domain;
     } catch { return false; }
   });
 
@@ -1604,7 +1649,7 @@ chrome.runtime.onStartup.addListener(() => {
 
 // Exposed for the Node test harness (no-op in the extension environment).
 if (typeof module !== 'undefined' && module.exports) {
-  module.exports = { matchDomain, mergeSnapshot, mergeByOrigin, mergeBearer, trimLargeValues, base64FromBytes, base64FromString, countOriginKeys, countIdbKeys, parseJwtExpMs, encodePayload, sha256Hex, getToken, invalidateToken, gsmFetch, handleMessage, syncDomain, completePendingAdd, normalizeDomain, isValidDomain, secretIdForDomain, secretIdCollision, countAuthTokens, countHeaderOnlyHosts, syncAlarmNames, domainFromSyncAlarm, destroyOldVersions, getBearerTokensForDomain, purgeCapturedAuthForDomain, registrableDomain, originsForDomain, syncAll, ownedBearerTokens, revokeOriginsFor, reclaimStrayOrigins,
+  module.exports = { matchDomain, mergeSnapshot, mergeByOrigin, mergeBearer, trimLargeValues, base64FromBytes, base64FromString, countOriginKeys, countIdbKeys, parseJwtExpMs, encodePayload, sha256Hex, getToken, invalidateToken, gsmFetch, handleMessage, syncDomain, completePendingAdd, normalizeDomain, isValidDomain, secretIdForDomain, secretIdCollision, countAuthTokens, countHeaderOnlyHosts, syncAlarmNames, domainFromSyncAlarm, destroyOldVersions, getBearerTokensForDomain, purgeCapturedAuthForDomain, registrableDomain, originsForDomain, syncAll, ownedBearerTokens, revokeOriginsFor, reclaimStrayOrigins, getStorageForDomain, getCookiesForDomain, ownershipScope,
     // Test-only handles on worker state that has no message-level accessor.
     _capturedBearerTokens: capturedBearerTokens,
     _setWatchedDomainsCache: (list) => { watchedDomainsCache = list; },

@@ -18,6 +18,8 @@ const store = {
 const spies = { fetches: [], destroyed: [], alarmsCleared: [], alarmsCreated: [], permsRemoved: [] };
 let identityShouldFail = false;
 let heldPermissions = null; // what chrome.permissions.getAll() reports
+let openTabs = [];          // what chrome.tabs.query() reports
+let tabStorage = {};        // per-tabId storage the injected script "returns"
 const noop = () => {};
 const listener = { addListener: noop, removeListener: noop };
 
@@ -65,7 +67,8 @@ global.chrome = {
       return cookieResponse;
     },
   },
-  tabs: { onUpdated: listener, onActivated: listener, query: async () => [] },
+  tabs: { onUpdated: listener, onActivated: listener, query: async () => openTabs },
+  scripting: { executeScript: async ({ target }) => [{ result: tabStorage[target.tabId] || { localStorage: {}, sessionStorage: {}, indexedDB: {} } }] },
   alarms: {
     onAlarm: listener,
     get: async () => null,
@@ -93,7 +96,6 @@ global.chrome = {
     },
     removeCachedAuthToken: async () => {},
   },
-  scripting: {},
 };
 
 const bg = require('../extension/background.js');
@@ -335,12 +337,40 @@ async function test(name, fn) {
     };
     delete store['pushHash_example.com'];
     cookieResponse = [];          // logged out, and the read succeeded
+    // Corroboration: a tab IS open and its storage is genuinely empty too.
+    openTabs = [{ id: 1, url: 'https://example.com/', incognito: false }];
+    tabStorage = { 1: { localStorage: {}, sessionStorage: {}, indexedDB: {} } };
     versionPages = [{ versions: [] }];
 
     await bg.syncDomain('example.com', {});
+    openTabs = []; tabStorage = {};
     const lkg = store['lkg_example.com'];
     assert.strictEqual(lkg.cookies.length, 0, 'cookies cleared');
     assert.deepStrictEqual(lkg.localStorage, {}, 'stale storage cleared on logout');
+  });
+
+  await test('0.5: cookies expiring does NOT wipe a session that still lives in localStorage', async () => {
+    store.domains = ['example.com'];
+    bg._setWatchedDomainsCache(['example.com']);
+    store.settings = { gcpProjectId: 'proj-1' };
+    store['lkg_example.com'] = {
+      cookies: [{ domain: '.example.com', name: 'sess', path: '/' }],
+      localStorage: { 'https://example.com': { token: 'still-valid' } },
+      sessionStorage: {}, indexedDB: {}, bearerTokens: {},
+    };
+    delete store['pushHash_example.com'];
+    cookieResponse = [];   // cookies gone...
+    // ...but the tab still holds an auth token. Declaring logout here would
+    // destroy a working session.
+    openTabs = [{ id: 1, url: 'https://example.com/', incognito: false }];
+    tabStorage = { 1: { localStorage: { token: 'still-valid' }, sessionStorage: {}, indexedDB: {} } };
+    versionPages = [{ versions: [] }];
+
+    await bg.syncDomain('example.com', {});
+    openTabs = []; tabStorage = {};
+    const lkg = store['lkg_example.com'];
+    assert.ok(Object.keys(lkg.localStorage).length > 0,
+      'storage-borne credentials must survive the cookies expiring');
   });
 
   await test('0.5 end-to-end: a FAILED cookie read does not clear anything', async () => {
@@ -633,6 +663,11 @@ async function test(name, fn) {
   });
 
   await test('X7: an upgrade reclaims over-broad grants an older build requested', async () => {
+    // Set up the watch list FIRST: import now reclaims strays itself, so
+    // seeding the legacy grants before it would let import consume them and
+    // leave this test asserting against an already-cleaned state.
+    await bg.handleMessage({ type: 'importState', state: { domains: ['app.example.com'] } });
+
     // Old builds walked every parent suffix and never gave the grants back.
     heldPermissions = {
       origins: [
@@ -644,7 +679,6 @@ async function test(name, fn) {
       ],
     };
     spies.permsRemoved = [];
-    await bg.handleMessage({ type: 'importState', state: { domains: ['app.example.com'] } });
 
     const res = await bg.reclaimStrayOrigins();
     assert.ok(res.removed.includes('*://*.co.uk/*'), 'public-suffix grant reclaimed');
@@ -664,6 +698,98 @@ async function test(name, fn) {
     assert.ok(!removed.includes('*://*.example.com/*'),
       'the parent scope the remaining sibling needs must survive');
     assert.ok(removed.includes('*://app.example.com/*'));
+  });
+
+  // ==========================================================
+  // Findings from the FIFTH verification round (on 914fa53)
+  // ==========================================================
+  await test('Y1: a watched child\'s storage does not land in the parent\'s secret', async () => {
+    const watched = ['example.com', 'app.example.com'];
+    store.domains = watched;
+    bg._setWatchedDomainsCache(watched);
+    openTabs = [
+      { id: 1, url: 'https://example.com/', incognito: false },
+      { id: 2, url: 'https://app.example.com/', incognito: false },   // owned by the child
+    ];
+    tabStorage = {
+      1: { localStorage: { parent: 'p' }, sessionStorage: {}, indexedDB: {} },
+      2: { localStorage: { childSecret: 'c' }, sessionStorage: {}, indexedDB: {} },
+    };
+
+    const parent = await bg.getStorageForDomain('example.com', watched);
+    const child = await bg.getStorageForDomain('app.example.com', watched);
+    openTabs = []; tabStorage = {};
+
+    assert.ok(!JSON.stringify(parent.localStorage).includes('childSecret'),
+      'the child tab\'s storage must not be collected for the parent');
+    assert.ok(JSON.stringify(parent.localStorage).includes('parent'), 'the parent still gets its own');
+    assert.ok(JSON.stringify(child.localStorage).includes('childSecret'), 'the child gets its own');
+  });
+
+  await test('Y2: an unwatched subdomain\'s storage still belongs to its parent', async () => {
+    const watched = ['example.com'];
+    store.domains = watched;
+    bg._setWatchedDomainsCache(watched);
+    openTabs = [{ id: 3, url: 'https://cdn.example.com/', incognito: false }];
+    tabStorage = { 3: { localStorage: { sub: 's' }, sessionStorage: {}, indexedDB: {} } };
+
+    const parent = await bg.getStorageForDomain('example.com', watched);
+    openTabs = []; tabStorage = {};
+    assert.ok(JSON.stringify(parent.localStorage).includes('sub'),
+      'with no more-specific watch, the subdomain is part of the parent session');
+  });
+
+  await test('Y3: a child-scoped cookie does not land in the parent\'s secret', async () => {
+    const watched = ['example.com', 'app.example.com'];
+    store.domains = watched;
+    bg._setWatchedDomainsCache(watched);
+    cookieResponse = [
+      { domain: '.example.com', name: 'shared', path: '/' },
+      { domain: '.app.example.com', name: 'childonly', path: '/' },
+      { domain: 'app.example.com', name: 'childhostonly', path: '/' },
+    ];
+
+    const parent = await bg.getCookiesForDomain('example.com', watched);
+    const child = await bg.getCookiesForDomain('app.example.com', watched);
+    cookieResponse = [{ domain: '.example.com', name: 'sess', path: '/' }];
+
+    const names = (r) => r.cookies.map(c => c.name).sort();
+    assert.deepStrictEqual(names(parent), ['shared'], 'parent keeps only what it owns');
+    assert.deepStrictEqual(names(child), ['childhostonly', 'childonly'], 'child keeps its own');
+  });
+
+  await test('Y4: import purges state for domains it drops', async () => {
+    await bg.handleMessage({ type: 'importState', state: { domains: ['example.com', 'gone.com'] } });
+    store['lkg_gone.com'] = { cookies: [{ name: 'x' }] };
+    store['syncStatus_gone.com'] = { lastSync: 'x' };
+    Object.assign(bg._capturedBearerTokens, { 'api.gone.com': { token: 'G' } });
+
+    await bg.handleMessage({ type: 'importState', state: { domains: ['example.com'] } });
+
+    assert.ok(!('lkg_gone.com' in store), 'dropped domain\'s last-known-good is purged');
+    assert.ok(!('syncStatus_gone.com' in store), 'and its status');
+    assert.ok(!('api.gone.com' in bg._capturedBearerTokens), 'and its captured auth');
+  });
+
+  await test('Y5: revocation uses the watch list as of revoke time, not a stale snapshot', async () => {
+    // Simulate a concurrent add landing between the lock and the revoke: the
+    // sibling that needs the shared parent scope appears only on the later read.
+    await bg.handleMessage({ type: 'importState', state: { domains: ['app.example.com'] } });
+    spies.permsRemoved = [];
+    const realGet = chrome.storage.local.get;
+    let reads = 0;
+    chrome.storage.local.get = async (keys) => {
+      const out = await realGet(keys);
+      const wantsDomains = keys === 'domains' || (Array.isArray(keys) && keys.includes('domains'));
+      if (wantsDomains && ++reads >= 2) out.domains = ['api.example.com']; // added concurrently
+      return out;
+    };
+    await bg.handleMessage({ type: 'removeDomain', domain: 'app.example.com' });
+    chrome.storage.local.get = realGet;
+
+    const removed = spies.permsRemoved.flatMap(o => o.origins || []);
+    assert.ok(!removed.includes('*://*.example.com/*'),
+      'the concurrently-added sibling keeps the parent scope it needs');
   });
 
   console.log(`\n${passed} passed, ${failed} failed`);

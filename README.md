@@ -311,7 +311,7 @@ four files. The consumer script is 75 lines of bash.
 - The OAuth scope is `cloud-platform` (broad). You could scope it down to just Secret Manager if
   you modify the manifest.
 - The extension only sends data to `secretmanager.googleapis.com` — check the CSP in `manifest.json`.
-- Old secret versions are automatically destroyed (keeps last 5 by default).
+- Old secret versions are automatically destroyed (keeps the newest 3). Disabled versions are destroyed too, since they still hold the credential.
 
 **Recommendations:**
 - Only sync domains you actually need for automation
